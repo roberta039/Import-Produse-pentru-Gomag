@@ -1,5 +1,13 @@
 from __future__ import annotations
 import streamlit as st
+# --- XDConnects creds -> env (for scrapers) ---
+import os as _os
+try:
+    _os.environ["XD_USER"] = str(st.secrets.get("SOURCES", {}).get("XD_USER", "")).strip()
+    _os.environ["XD_PASS"] = str(st.secrets.get("SOURCES", {}).get("XD_PASS", "")).strip()
+except Exception:
+    pass
+
 import pandas as pd
 import tempfile
 from src.utils import detect_url_column
