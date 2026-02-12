@@ -115,8 +115,13 @@ def _extract_desc(soup: BeautifulSoup) -> str:
     )
     if ogd and len(ogd) > 40:
         return f"<p>{ogd}</p>"
-    # Try common containers
-    for sel in [".product-description", "[itemprop="description"]", "#description", ".description"]:
+    # Try common containers (FIX: quotes escaped correctly)
+    for sel in [
+        ".product-description",
+        '[itemprop="description"]',
+        "#description",
+        ".description",
+    ]:
         el = soup.select_one(sel)
         if el and len(el.get_text(strip=True)) > 50:
             return str(el)
@@ -130,7 +135,6 @@ async def _auto_scroll(page, steps: int = 10, step_px: int = 900, wait_ms: int =
 
 
 async def _accept_cookies_if_any(page):
-    # Best-effort for common consent buttons
     candidates = [
         'button:has-text("Accept")',
         'button:has-text("I agree")',
@@ -151,7 +155,6 @@ async def _accept_cookies_if_any(page):
 
 
 async def _fetch_with_login(url: str, email: str, password: str, wait_ms: int = 1500) -> tuple[str, str]:
-    # returns (html, notes)
     p = urlparse(url)
     locale = "en-gb"
     parts = [x for x in p.path.split("/") if x]
@@ -178,26 +181,24 @@ async def _fetch_with_login(url: str, email: str, password: str, wait_ms: int = 
         page = await context.new_page()
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
-        # Go to login
         await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(700)
         await _accept_cookies_if_any(page)
 
-        # Fill login (selectors are intentionally broad)
         await page.fill('input[type="email"], input[name*="email" i], input[id*="email" i]', email)
         await page.fill('input[type="password"], input[name*="pass" i], input[id*="pass" i]', password)
 
-        # Submit
         try:
-            await page.click('button[type="submit"], input[type="submit"], button:has-text("Login"), button:has-text("Log in")', timeout=8000)
+            await page.click(
+                'button[type="submit"], input[type="submit"], button:has-text("Login"), button:has-text("Log in")',
+                timeout=8000,
+            )
         except Exception:
-            # sometimes the form uses a specific button class
             await page.keyboard.press("Enter")
 
         await page.wait_for_timeout(1200)
         await _accept_cookies_if_any(page)
 
-        # Now open the product URL
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(wait_ms)
         await _auto_scroll(page, steps=12, step_px=900, wait_ms=200)
@@ -222,7 +223,6 @@ class XDConnectsScraper(Scraper):
         password = os.getenv("XD_PASS", "").strip()
 
         if not email or not password:
-            # We can still try without login, but XDConnects often 403 from datacenter IPs.
             return ProductDraft(
                 source_url=url,
                 domain=domain_of(url),
@@ -240,7 +240,6 @@ class XDConnectsScraper(Scraper):
         html, login_note = asyncio.run(_fetch_with_login(url, email, password, wait_ms=1600))
         soup = BeautifulSoup(html, "lxml")
 
-        # If still blocked, show it clearly
         page_title = clean_text(soup.title.get_text()) if soup.title else ""
         if "403" in page_title.lower() or "access" in page_title.lower():
             return ProductDraft(
@@ -261,7 +260,7 @@ class XDConnectsScraper(Scraper):
         title = None
         sku = None
         price = None
-        images = []
+        images: list[str] = []
 
         if prod:
             title = clean_text(str(prod.get("name") or "")) or None
@@ -270,7 +269,11 @@ class XDConnectsScraper(Scraper):
             images = _jsonld_get_images(prod)
 
         if not title:
-            title = _meta_content(soup, ['meta[property="og:title"]', 'meta[name="twitter:title"]']) or _meta_content(soup, ['meta[name="title"]']) or "Produs"
+            title = (
+                _meta_content(soup, ['meta[property="og:title"]', 'meta[name="twitter:title"]'])
+                or _meta_content(soup, ['meta[name="title"]'])
+                or "Produs"
+            )
 
         desc_html = _extract_desc(soup) or "<p></p>"
 
@@ -288,5 +291,5 @@ class XDConnectsScraper(Scraper):
             price=price,
             currency="RON",
             needs_translation=False,
-            notes=f"parsed_with=playwright | {login_note} | xd_scraper=v1",
+            notes=f"parsed_with=playwright | {login_note} | xd_scraper=v1.1",
         )
