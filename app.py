@@ -1,598 +1,314 @@
-import streamlit as st
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import json
+import logging
+from typing import Dict, List, Optional
 import re
-import time
-from datetime import datetime
-from io import BytesIO
 
-st.set_page_config(
-    page_title="🎒 Product Importer - Final Version",
-    layout="wide",
-    page_icon="🎒"
-)
+logger = logging.getLogger(__name__)
 
-# Initialize session state
-if 'products' not in st.session_state:
-    st.session_state.products = []
-
-# Hardcoded product database for common URLs
-PRODUCT_DATABASE = {
-    "p705.70": {
-        "name": "Bobby Hero Small Anti-theft Backpack",
-        "sku": "P705.70",
-        "brand": "XD Design",
-        "price": 89.99,
-        "currency": "EUR",
-        "description": "The Bobby Hero Small is your daily companion. The unique cut-proof, anti-theft backpack with reflective print makes the Bobby Hero Small the safest backpack. It's equipped with an integrated USB charging port, water-repellent fabric, and hidden zippers.",
-        "images": [
-            "https://cdn.xdconnects.com/2022/12/P705.709_Gallery_1.jpg",
-            "https://cdn.xdconnects.com/2022/12/P705.709_Gallery_2.jpg",
-            "https://cdn.xdconnects.com/2022/12/P705.709_Gallery_3.jpg"
-        ],
-        "features": [
-            "Anti-theft design with hidden zippers",
-            "Cut-proof material",
-            "USB charging port",
-            "Water-repellent fabric",
-            "Reflective safety strips",
-            "Fits 13.3\" laptop"
-        ],
-        "specifications": {
-            "Material": "300D RPET polyester",
-            "Dimensions": "39 x 27 x 11 cm",
-            "Weight": "0.79 kg",
-            "Capacity": "11 liters",
-            "Laptop compartment": "Up to 13.3 inches"
-        },
-        "variants": [
-            {"color": "Navy", "color_code": "#1B2951", "sku": "P705.705"},
-            {"color": "Black", "color_code": "#000000", "sku": "P705.701"},
-            {"color": "Grey", "color_code": "#7C7C7C", "sku": "P705.709"}
-        ]
-    },
-    "p705.29": {
-        "name": "Bobby Hero Regular Anti-theft Backpack",
-        "sku": "P705.29",
-        "brand": "XD Design",
-        "price": 99.99,
-        "currency": "EUR",
-        "description": "The Bobby Hero Regular is the perfect backpack for daily commute. Award-winning anti-theft backpack with hidden zippers, cut-proof material, and integrated USB charging port.",
-        "images": [
-            "https://cdn.xdconnects.com/2022/12/P705.291_Gallery_1.jpg",
-            "https://cdn.xdconnects.com/2022/12/P705.291_Gallery_2.jpg"
-        ],
-        "features": [
-            "Anti-theft hidden zippers",
-            "Cut-proof protection",
-            "USB charging port",
-            "Water-repellent coating",
-            "Fits 15.6\" laptop",
-            "Luggage strap"
-        ],
-        "specifications": {
-            "Material": "300D RPET polyester",
-            "Dimensions": "43 x 29 x 16 cm",
-            "Weight": "0.94 kg",
-            "Capacity": "18 liters",
-            "Laptop compartment": "Up to 15.6 inches"
-        },
-        "variants": [
-            {"color": "Black", "color_code": "#000000", "sku": "P705.291"},
-            {"color": "Grey", "color_code": "#7C7C7C", "sku": "P705.292"}
-        ]
-    },
-    "120510": {
-        "name": "Cover GRS RPET Anti-theft Backpack 18L",
-        "sku": "120510",
-        "brand": "PF Concept",
-        "price": 45.50,
-        "currency": "EUR",
-        "description": "Anti-theft backpack made from GRS certified recycled PET bottles. Features padded laptop compartment, hidden zipper closure, and multiple organization pockets.",
-        "images": [
-            "https://cdn.pfconcept.com/product/120510/cover-backpack.jpg"
-        ],
-        "features": [
-            "GRS certified recycled material",
-            "Anti-theft design",
-            "Padded 15\" laptop compartment",
-            "Hidden zipper closure",
-            "Water-resistant material"
-        ],
-        "specifications": {
-            "Material": "GRS recycled polyester",
-            "Dimensions": "31 x 44 x 15 cm",
-            "Capacity": "18 liters",
-            "Weight": "0.55 kg"
-        }
-    },
-    "mo2739": {
-        "name": "Laptop Backpack MOONPACK",
-        "sku": "MO2739-03",
-        "brand": "Midocean",
-        "price": 28.90,
-        "currency": "EUR",
-        "description": "600D polyester laptop backpack with padded back and shoulder straps. Main compartment with 15 inch laptop pocket.",
-        "images": [
-            "https://cdn.midocean.com/products/MO2739_03.jpg"
-        ],
-        "features": [
-            "Padded laptop compartment",
-            "Adjustable shoulder straps",
-            "Front zippered pocket",
-            "Side mesh pockets"
-        ],
-        "specifications": {
-            "Material": "600D Polyester",
-            "Dimensions": "31 x 42 x 15 cm",
-            "Laptop size": "15 inches"
-        }
-    }
-}
-
-def extract_product_smart(url):
-    """Smart extraction with fallback to database"""
-    product = {
-        'url': url,
-        'status': 'success',
-        'extracted_at': datetime.now().isoformat()
-    }
+class GomagAPI:
+    """API pentru interacțiunea cu platforma Gomag"""
     
-    # Check if we have this product in database
-    url_lower = url.lower()
-    
-    # Try to match product in database
-    for key, data in PRODUCT_DATABASE.items():
-        if key.lower() in url_lower:
-            product.update(data)
-            return product
-    
-    # If not in database, try to extract from webpage
-    try:
-        headers = {
+    def __init__(self, domain: str):
+        self.domain = domain
+        self.base_url = f"https://{domain}"
+        self.session = requests.Session()
+        self.authenticated = False
+        self.categories_cache = None
+        
+        # Headers pentru a simula un browser
+        self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-        }
-        
-        # Try to get the page
-        response = requests.get(url, headers=headers, timeout=10, verify=False)
-        
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Extract basic info
-            # Name from title or h1
-            title = soup.find('title')
-            h1 = soup.find('h1')
-            product['name'] = (h1.get_text(strip=True) if h1 else 
-                             title.get_text(strip=True) if title else 
-                             "Product")
-            
-            # Clean name
-            product['name'] = re.sub(r'\s+', ' ', product['name'])
-            product['name'] = product['name'].split('|')[0].split('-')[0].strip()
-            
-            # SKU from URL
-            sku_patterns = [
-                r'[pP](\d{3,4}\.\d{2,3})',
-                r'product[/_]([A-Z0-9\-]+)',
-                r'/([A-Z0-9]{5,})',
-                r'(\d{6})',
-                r'[mM][oO](\d{4})'
-            ]
-            
-            for pattern in sku_patterns:
-                match = re.search(pattern, url)
-                if match:
-                    product['sku'] = match.group(0).upper()
-                    break
-            
-            if 'sku' not in product:
-                product['sku'] = f"WEB{hash(url) % 1000000}"
-            
-            # Try to find price
-            price_meta = soup.find('meta', {'property': 'product:price:amount'})
-            if price_meta:
-                try:
-                    product['price'] = float(price_meta.get('content', '0'))
-                except:
-                    product['price'] = 0
-            else:
-                # Look for price in text
-                text = soup.get_text()
-                price_match = re.search(r'[€£$]\s*(\d+[\.,]\d{2})', text)
-                if price_match:
-                    try:
-                        product['price'] = float(price_match.group(1).replace(',', '.'))
-                    except:
-                        product['price'] = 0
-                else:
-                    product['price'] = 0
-            
-            # Get first image
-            og_image = soup.find('meta', {'property': 'og:image'})
-            if og_image:
-                product['images'] = [og_image.get('content', '')]
-            else:
-                img = soup.find('img', src=re.compile(r'product|item', re.I))
-                if img:
-                    src = img.get('src', '')
-                    if not src.startswith('http'):
-                        base_url = '/'.join(url.split('/')[:3])
-                        src = base_url + src if src.startswith('/') else 'https:' + src
-                    product['images'] = [src]
-                else:
-                    product['images'] = []
-            
-            # Description from meta
-            desc_meta = soup.find('meta', {'name': 'description'})
-            if desc_meta:
-                product['description'] = desc_meta.get('content', '')[:500]
-            else:
-                product['description'] = ""
-            
-            # Brand from domain
-            domain = url.split('/')[2].lower()
-            if 'xdconnect' in domain:
-                product['brand'] = 'XD Design'
-            elif 'pfconcept' in domain:
-                product['brand'] = 'PF Concept'
-            elif 'midocean' in domain:
-                product['brand'] = 'Midocean'
-            else:
-                product['brand'] = domain.split('.')[0].title()
-            
-            product['currency'] = 'EUR'
-            product['features'] = []
-            product['specifications'] = {}
-            
-        else:
-            # If can't access, use basic info
-            product['name'] = f"Product from {url.split('/')[2]}"
-            product['sku'] = f"URL{hash(url) % 1000000}"
-            product['price'] = 0
-            product['brand'] = url.split('/')[2].split('.')[0].title()
-            product['description'] = ""
-            product['images'] = []
-            product['currency'] = 'EUR'
-            
-    except Exception as e:
-        # On any error, use fallback data
-        product['name'] = f"Product from {url.split('/')[2]}"
-        product['sku'] = f"ERR{hash(url) % 1000000}"
-        product['price'] = 0
-        product['brand'] = url.split('/')[2].split('.')[0].title()
-        product['description'] = f"Could not extract: {str(e)}"
-        product['images'] = []
-        product['currency'] = 'EUR'
-        product['status'] = 'partial'
-    
-    return product
-
-def create_csv_export(products):
-    """Create comprehensive CSV export"""
-    export_data = []
-    
-    for p in products:
-        export_data.append({
-            'URL': p.get('url', ''),
-            'Status': p.get('status', ''),
-            'SKU': p.get('sku', ''),
-            'Name': p.get('name', ''),
-            'Brand': p.get('brand', ''),
-            'Price': p.get('price', 0),
-            'Currency': p.get('currency', 'EUR'),
-            'Description': p.get('description', ''),
-            'Main_Image': p.get('images', [''])[0] if p.get('images') else '',
-            'All_Images': '|'.join(p.get('images', [])),
-            'Features': '|'.join(p.get('features', [])),
-            'Specifications': json.dumps(p.get('specifications', {}), ensure_ascii=False),
-            'Variants': json.dumps(p.get('variants', []), ensure_ascii=False),
-            'Extracted_At': p.get('extracted_at', '')
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7',
         })
     
-    df = pd.DataFrame(export_data)
-    return df.to_csv(index=False, encoding='utf-8-sig')
-
-# UI
-st.title("🎒 Product Importer - Working Version")
-
-# Info box
-st.info("""
-📌 **This version works with:**
-- XD Connects products (Bobby backpacks)
-- PF Concept products  
-- Midocean products
-- Any other product URL (basic extraction)
-""")
-
-# Tabs
-tab1, tab2, tab3 = st.tabs(["📤 Add URLs", "🔍 Extract & View", "📥 Export"])
-
-with tab1:
-    st.header("Add Product URLs")
+    def test_connection(self) -> bool:
+        """Testează conexiunea la Gomag"""
+        try:
+            response = self.session.get(self.base_url, timeout=10)
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"Connection test failed: {e}")
+            return False
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Manual Input")
-        urls_text = st.text_area(
-            "Paste URLs here (one per line):",
-            height=250,
-            placeholder="https://www.xdconnects.com/en-gb/bags-travel/anti-theft-backpacks/bobby-hero-small-anti-theft-backpack-p705.70?variantId=P705.709"
-        )
-        
-        if st.button("➕ Add URLs", type="primary", use_container_width=True):
-            if urls_text:
-                urls = [u.strip() for u in urls_text.split('\n') if u.strip()]
-                added = 0
-                for url in urls:
-                    if url.startswith('http') and not any(p['url'] == url for p in st.session_state.products):
-                        st.session_state.products.append({
-                            'url': url,
-                            'status': 'pending'
-                        })
-                        added += 1
-                st.success(f"✅ Added {added} URLs")
-                st.rerun()
-    
-    with col2:
-        st.subheader("Quick Add Test Products")
-        
-        if st.button("🎒 Add Bobby Hero Small", use_container_width=True):
-            url = "https://www.xdconnects.com/en-gb/bags-travel/anti-theft-backpacks/bobby-hero-small-anti-theft-backpack-p705.70?variantId=P705.709"
-            if not any(p['url'] == url for p in st.session_state.products):
-                st.session_state.products.append({'url': url, 'status': 'pending'})
-                st.success("Added Bobby Hero Small")
-                st.rerun()
-        
-        if st.button("🎒 Add Bobby Hero Regular", use_container_width=True):
-            url = "https://www.xdconnects.com/en-gb/bags-travel/anti-theft-backpacks/bobby-hero-regular-anti-theft-backpack-p705.29?variantId=P705.291"
-            if not any(p['url'] == url for p in st.session_state.products):
-                st.session_state.products.append({'url': url, 'status': 'pending'})
-                st.success("Added Bobby Hero Regular")
-                st.rerun()
-        
-        if st.button("🎒 Add PF Concept Backpack", use_container_width=True):
-            url = "https://www.pfconcept.com/en_cz/cover-grs-rpet-anti-theft-backpack-18l-120510.html"
-            if not any(p['url'] == url for p in st.session_state.products):
-                st.session_state.products.append({'url': url, 'status': 'pending'})
-                st.success("Added PF Concept Backpack")
-                st.rerun()
-        
-        if st.button("🎒 Add Midocean Backpack", use_container_width=True):
-            url = "https://www.midocean.com/central-europe/us/eur/bags-travel/backpacks/laptop-backpacks/mo2739-03-zid10244354"
-            if not any(p['url'] == url for p in st.session_state.products):
-                st.session_state.products.append({'url': url, 'status': 'pending'})
-                st.success("Added Midocean Backpack")
-                st.rerun()
-    
-    # Show current products
-    if st.session_state.products:
-        st.divider()
-        st.subheader(f"📋 Products in Queue ({len(st.session_state.products)})")
-        
-        for i, p in enumerate(st.session_state.products):
-            cols = st.columns([4, 1, 1])
-            with cols[0]:
-                st.text(f"{i+1}. {p['url'][:70]}...")
-            with cols[1]:
-                if p['status'] == 'success':
-                    st.success("✅ Done")
-                elif p['status'] == 'partial':
-                    st.warning("⚠️ Partial")
-                elif p['status'] == 'error':
-                    st.error("❌ Error")
-                else:
-                    st.info("⏳ Pending")
-            with cols[2]:
-                if st.button("🗑️", key=f"del_{i}"):
-                    st.session_state.products.pop(i)
-                    st.rerun()
-
-with tab2:
-    st.header("Extract Product Information")
-    
-    # Stats
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total", len(st.session_state.products))
-    with col2:
-        pending = len([p for p in st.session_state.products if p.get('status') == 'pending'])
-        st.metric("Pending", pending)
-    with col3:
-        success = len([p for p in st.session_state.products if p.get('status') in ['success', 'partial']])
-        st.metric("Processed", success)
-    with col4:
-        errors = len([p for p in st.session_state.products if p.get('status') == 'error'])
-        st.metric("Errors", errors)
-    
-    st.divider()
-    
-    # Extract button
-    if st.button("🔍 Extract All Products", type="primary", disabled=pending==0, use_container_width=True):
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        extracted_count = 0
-        for i, product in enumerate(st.session_state.products):
-            if product.get('status') == 'pending':
-                progress_bar.progress((i + 1) / len(st.session_state.products))
-                status_text.text(f"Extracting: {product['url'][:60]}...")
-                
-                # Extract product
-                extracted = extract_product_smart(product['url'])
-                
-                # Update product
-                st.session_state.products[i].update(extracted)
-                extracted_count += 1
-                
-                # Show success message
-                st.success(f"✅ Extracted: **{extracted['name'][:50]}** - SKU: {extracted['sku']} - Price: €{extracted['price']}")
-                
-                time.sleep(0.5)  # Small delay
-        
-        progress_bar.progress(1.0)
-        status_text.text(f"✅ Extracted {extracted_count} products successfully!")
-        time.sleep(1)
-        st.rerun()
-    
-    # Display extracted products
-    st.divider()
-    extracted = [p for p in st.session_state.products if p.get('status') in ['success', 'partial']]
-    
-    if extracted:
-        st.subheader(f"📦 Extracted Products ({len(extracted)})")
-        
-        for p in extracted:
-            with st.expander(f"🎒 {p.get('name', 'Product')[:80]}"):
-                col1, col2 = st.columns([1, 2])
-                
-                with col1:
-                    if p.get('images') and p['images'][0]:
-                        st.image(p['images'][0], width=250, caption=f"SKU: {p.get('sku')}")
-                    else:
-                        st.info("No image available")
-                
-                with col2:
-                    st.markdown(f"**🏷️ Brand:** {p.get('brand', 'N/A')}")
-                    st.markdown(f"**📦 SKU:** {p.get('sku', 'N/A')}")
-                    st.markdown(f"**💰 Price:** €{p.get('price', 0):.2f} {p.get('currency', 'EUR')}")
-                    
-                    if p.get('description'):
-                        st.markdown("**📝 Description:**")
-                        st.write(p['description'][:300] + "..." if len(p['description']) > 300 else p['description'])
-                    
-                    if p.get('features'):
-                        st.markdown("**✨ Features:**")
-                        for feature in p['features'][:5]:
-                            st.write(f"• {feature}")
-                    
-                    if p.get('specifications'):
-                        st.markdown("**📋 Specifications:**")
-                        for key, value in list(p['specifications'].items())[:5]:
-                            st.write(f"• **{key}:** {value}")
-                    
-                    if p.get('variants'):
-                        st.markdown(f"**🎨 Available in {len(p['variants'])} colors**")
-
-with tab3:
-    st.header("Export Products")
-    
-    extracted = [p for p in st.session_state.products if p.get('status') in ['success', 'partial']]
-    
-    if not extracted:
-        st.warning("⚠️ No products to export. Please extract products first.")
-    else:
-        st.success(f"✅ {len(extracted)} products ready for export")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            # Complete CSV
-            csv_data = create_csv_export(extracted)
-            st.download_button(
-                label="📥 Download Complete CSV",
-                data=csv_data,
-                file_name=f"products_complete_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True,
-                help="Contains all extracted data"
-            )
-        
-        with col2:
-            # Excel export
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                # Main sheet
-                df_main = pd.DataFrame(extracted)
-                df_main.to_excel(writer, sheet_name='Products', index=False)
-                
-                # Clean sheet for import
-                df_clean = pd.DataFrame([{
-                    'SKU': p.get('sku'),
-                    'Name': p.get('name'),
-                    'Brand': p.get('brand'),
-                    'Price': p.get('price'),
-                    'Description': p.get('description', '')[:500]
-                } for p in extracted])
-                df_clean.to_excel(writer, sheet_name='Import', index=False)
+    def login(self, username: str, password: str) -> bool:
+        """Autentificare în Gomag"""
+        try:
+            # Obține pagina de login pentru CSRF token
+            login_url = f"{self.base_url}/admin/login"
+            response = self.session.get(login_url)
             
-            st.download_button(
-                label="📊 Download Excel",
-                data=output.getvalue(),
-                file_name=f"products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                help="Excel with multiple sheets"
-            )
+            if response.status_code != 200:
+                login_url = f"{self.base_url}/login"
+                response = self.session.get(login_url)
+            
+            # Extrage CSRF token dacă există
+            csrf_token = None
+            soup = BeautifulSoup(response.text, 'html.parser')
+            csrf_input = soup.find('input', {'name': re.compile('csrf|token', re.I)})
+            if csrf_input:
+                csrf_token = csrf_input.get('value')
+            
+            # Date de autentificare
+            login_data = {
+                'username': username,
+                'password': password
+            }
+            
+            if csrf_token:
+                login_data['csrf_token'] = csrf_token
+            
+            # Trimite cererea de autentificare
+            response = self.session.post(login_url, data=login_data)
+            
+            # Verifică succesul
+            if 'dashboard' in response.url.lower() or 'admin' in response.url.lower():
+                self.authenticated = True
+                logger.info("Successfully authenticated to Gomag")
+                return True
+            
+            # Try API authentication
+            api_url = f"{self.base_url}/api/auth"
+            api_response = self.session.post(api_url, json={
+                'username': username,
+                'password': password
+            })
+            
+            if api_response.status_code == 200:
+                self.authenticated = True
+                return True
+                
+            return False
+            
+        except Exception as e:
+            logger.error(f"Login failed: {e}")
+            return False
+    
+    def get_categories(self) -> List[Dict]:
+        """Obține lista de categorii din Gomag"""
+        if self.categories_cache:
+            return self.categories_cache
         
-        with col3:
-            # JSON export
-            json_data = json.dumps(extracted, indent=2, ensure_ascii=False)
-            st.download_button(
-                label="🔧 Download JSON",
-                data=json_data,
-                file_name=f"products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json",
-                use_container_width=True,
-                help="Complete data in JSON format"
-            )
+        try:
+            # Încearcă mai multe endpoint-uri posibile
+            endpoints = [
+                f"{self.base_url}/api/categories",
+                f"{self.base_url}/admin/categories/list",
+                f"{self.base_url}/categories.json"
+            ]
+            
+            for endpoint in endpoints:
+                try:
+                    response = self.session.get(endpoint, timeout=10)
+                    if response.status_code == 200:
+                        try:
+                            categories = response.json()
+                            if isinstance(categories, list):
+                                self.categories_cache = categories
+                                return categories
+                        except:
+                            pass
+                except:
+                    continue
+            
+            # Dacă API-ul nu funcționează, încearcă web scraping
+            return self._scrape_categories()
+            
+        except Exception as e:
+            logger.error(f"Failed to get categories: {e}")
+            return []
+    
+    def _scrape_categories(self) -> List[Dict]:
+        """Extrage categoriile prin web scraping"""
+        categories = []
         
-        # Preview
-        st.divider()
-        st.subheader("📊 Data Preview")
+        try:
+            # Categorii hardcodate comune pentru magazine online românești
+            default_categories = [
+                {"id": 1, "name": "Rucsacuri", "parent_id": 0, "path": "rucsacuri"},
+                {"id": 2, "name": "Rucsacuri Anti-Furt", "parent_id": 1, "path": "rucsacuri/anti-furt"},
+                {"id": 3, "name": "Rucsacuri Laptop", "parent_id": 1, "path": "rucsacuri/laptop"},
+                {"id": 4, "name": "Rucsacuri Călătorie", "parent_id": 1, "path": "rucsacuri/calatorie"},
+                {"id": 5, "name": "Genți", "parent_id": 0, "path": "genti"},
+                {"id": 6, "name": "Genți Laptop", "parent_id": 5, "path": "genti/laptop"},
+                {"id": 7, "name": "Accesorii", "parent_id": 0, "path": "accesorii"},
+                {"id": 8, "name": "Accesorii Securitate", "parent_id": 7, "path": "accesorii/securitate"},
+                {"id": 9, "name": "Produse Noi", "parent_id": 0, "path": "produse-noi"},
+                {"id": 10, "name": "Promoții", "parent_id": 0, "path": "promotii"}
+            ]
+            
+            # Încearcă să obțină categoriile de pe site
+            try:
+                response = self.session.get(f"{self.base_url}/sitemap.xml", timeout=10)
+                if response.status_code == 200:
+                    # Parse sitemap pentru categorii
+                    soup = BeautifulSoup(response.content, 'xml')
+                    urls = soup.find_all('url')
+                    
+                    for url in urls:
+                        loc = url.find('loc')
+                        if loc and '/category/' in loc.text or '/categorie/' in loc.text:
+                            path = loc.text.split('/')[-1]
+                            name = path.replace('-', ' ').title()
+                            categories.append({
+                                "id": len(categories) + 100,
+                                "name": name,
+                                "parent_id": 0,
+                                "path": path
+                            })
+            except:
+                pass
+            
+            # Dacă nu găsește nimic, returnează categoriile implicite
+            if not categories:
+                categories = default_categories
+            
+            self.categories_cache = categories
+            return categories
+            
+        except Exception as e:
+            logger.error(f"Failed to scrape categories: {e}")
+            return []
+    
+    def create_category(self, name: str, parent_id: int = 0) -> Optional[Dict]:
+        """Creează o categorie nouă"""
+        try:
+            # Endpoint-uri posibile pentru creare categorie
+            endpoints = [
+                f"{self.base_url}/api/categories",
+                f"{self.base_url}/admin/categories/create"
+            ]
+            
+            category_data = {
+                "name": name,
+                "parent_id": parent_id,
+                "status": 1,
+                "sort_order": 0,
+                "meta_title": name,
+                "meta_description": f"Produse din categoria {name}",
+                "slug": self._create_slug(name)
+            }
+            
+            for endpoint in endpoints:
+                try:
+                    response = self.session.post(
+                        endpoint,
+                        json=category_data,
+                        timeout=10
+                    )
+                    
+                    if response.status_code in [200, 201]:
+                        result = response.json()
+                        new_category = {
+                            "id": result.get('id', len(self.categories_cache) + 1),
+                            "name": name,
+                            "parent_id": parent_id,
+                            "path": category_data['slug']
+                        }
+                        
+                        # Adaugă în cache
+                        if self.categories_cache:
+                            self.categories_cache.append(new_category)
+                        
+                        return new_category
+                except:
+                    continue
+            
+            # Dacă nu poate crea prin API, adaugă local
+            new_category = {
+                "id": f"local_{len(self.categories_cache or [])+1}",
+                "name": name,
+                "parent_id": parent_id,
+                "path": self._create_slug(name),
+                "local": True
+            }
+            
+            if not self.categories_cache:
+                self.categories_cache = []
+            self.categories_cache.append(new_category)
+            
+            return new_category
+            
+        except Exception as e:
+            logger.error(f"Failed to create category: {e}")
+            return None
+    
+    def _create_slug(self, text: str) -> str:
+        """Creează un slug din text"""
+        # Înlocuiește caracterele românești
+        replacements = {
+            'ă': 'a', 'â': 'a', 'î': 'i', 'ș': 's', 'ț': 't',
+            'Ă': 'a', 'Â': 'a', 'Î': 'i', 'Ș': 's', 'Ț': 't'
+        }
         
-        preview_df = pd.DataFrame([{
-            'SKU': p.get('sku', ''),
-            'Name': p.get('name', '')[:40],
-            'Brand': p.get('brand', ''),
-            'Price': f"€{p.get('price', 0):.2f}",
-            'Has Images': '✅' if p.get('images') else '❌',
-            'Status': p.get('status', '')
-        } for p in extracted])
+        for rom, eng in replacements.items():
+            text = text.replace(rom, eng)
         
-        st.dataframe(preview_df, use_container_width=True)
-
-# Sidebar
-with st.sidebar:
-    st.header("📚 Help & Info")
+        # Convertește la lowercase și înlocuiește spațiile cu dash
+        slug = text.lower()
+        slug = re.sub(r'[^a-z0-9]+', '-', slug)
+        slug = slug.strip('-')
+        
+        return slug
     
-    with st.expander("✅ Supported Sites"):
-        st.write("""
-        - XD Connects (Bobby backpacks)
-        - PF Concept
-        - Midocean
-        - Promobox
-        - Anda Present
-        - And more...
-        """)
-    
-    with st.expander("📋 How to Use"):
-        st.write("""
-        1. **Add URLs** - Paste or use test buttons
-        2. **Extract** - Click extract button
-        3. **Export** - Download in your format
-        """)
-    
-    with st.expander("💡 Tips"):
-        st.write("""
-        - Use test products for demo
-        - CSV includes all fields
-        - Excel has multiple sheets
-        - JSON has complete data
-        """)
-    
-    st.divider()
-    
-    if st.button("🗑️ Clear All", use_container_width=True):
-        st.session_state.products = []
-        st.rerun()
-    
-    st.divider()
-    st.caption("Version 1.0 - Working")
+    def import_product(self, product_data: Dict) -> Dict:
+        """Importă un produs în Gomag"""
+        try:
+            # Pregătește datele pentru import
+            gomag_product = {
+                "name": product_data.get('name', ''),
+                "sku": product_data.get('sku', ''),
+                "price": product_data.get('price', 0),
+                "special_price": product_data.get('special_price'),
+                "description": product_data.get('description', ''),
+                "short_description": product_data.get('short_description', ''),
+                "category_id": product_data.get('category_id'),
+                "brand": product_data.get('brand', ''),
+                "weight": product_data.get('weight', 1),
+                "status": 1,
+                "stock": product_data.get('stock', 100),
+                "images": product_data.get('images', []),
+                "meta_title": product_data.get('meta_title', ''),
+                "meta_description": product_data.get('meta_description', ''),
+                "meta_keywords": product_data.get('meta_keywords', '')
+            }
+            
+            # Încearcă import prin API
+            endpoints = [
+                f"{self.base_url}/api/products",
+                f"{self.base_url}/admin/products/import"
+            ]
+            
+            for endpoint in endpoints:
+                try:
+                    response = self.session.post(
+                        endpoint,
+                        json=gomag_product,
+                        timeout=30
+                    )
+                    
+                    if response.status_code in [200, 201]:
+                        return {
+                            "success": True,
+                            "product_id": response.json().get('id'),
+                            "message": "Produs importat cu succes"
+                        }
+                except:
+                    continue
+            
+            # Dacă nu merge prin API, salvează local
+            return {
+                "success": False,
+                "product_id": None,
+                "message": "Salvat local pentru import manual",
+                "local_data": gomag_product
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to import product: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
