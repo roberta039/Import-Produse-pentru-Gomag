@@ -18,6 +18,8 @@ from ..utils import clean_text, domain_of, ensure_sku
 LOGIN_URL = "https://psiproductfinder.de/login"
 
 
+# --- helpers ---
+
 def _meta(soup: BeautifulSoup, key: str) -> str:
     el = soup.select_one(f'meta[property="{key}"]') or soup.select_one(f'meta[name="{key}"]')
     if el and el.get("content"):
@@ -86,35 +88,116 @@ def _parse_next_data(soup: BeautifulSoup) -> dict | None:
         return None
 
 
-def _best_text_block_html(soup: BeautifulSoup) -> str:
-    """Fallback: find the biggest relevant text block and wrap into <p>..</p>."""
-    # Try main containers first
-    candidates = [
+_UNWANTED_PATTERNS = [
+    r"\bprevious\b",
+    r"\bnext\b",
+    r"\bangebot\s+anfragen\b",
+    r"\bkontakt\b",
+    r"\banmelden\b",
+    r"\blogin\b",
+    r"\bpreise?\b",
+    r"\bproduktfinder\b",
+    r"\bmen[üu]\b",
+    r"\bsuche\b",
+    r"\bprodukt\s*details\b",
+    r"\bkonfigurieren\b",
+    r"\bwarenkorb\b",
+]
+_UNWANTED_RE = re.compile("|".join(_UNWANTED_PATTERNS), flags=re.I)
+
+
+def _clean_paragraphs(paras: list[str]) -> list[str]:
+    out: list[str] = []
+    for p in paras:
+        p = re.sub(r"\s+", " ", p).strip()
+        if not p or len(p) < 40:
+            continue
+        if _UNWANTED_RE.search(p):
+            continue
+        # Drop lines that are mostly UI words or numbers
+        if sum(ch.isalpha() for ch in p) < 25:
+            continue
+        out.append(p)
+    # Deduplicate
+    seen = set()
+    dedup = []
+    for p in out:
+        key = p.lower()
+        if key not in seen:
+            seen.add(key)
+            dedup.append(p)
+    return dedup
+
+
+def _best_description_html(soup: BeautifulSoup) -> str:
+    """Return cleaned description as HTML paragraphs.
+
+    Strategy:
+    1) Look for likely description containers and collect <p>/<li> text.
+    2) If not found, strip UI parts from <main>/<article> and collect paragraphs.
+    3) Clean with heuristics (remove 'Previous/Next', CTA etc).
+    """
+    # 1) likely containers
+    selectors = [
+        "[itemprop=description]",
+        ".description",
+        ".product-description",
+        ".product__description",
+        ".productDetail",
+        ".product-detail",
+        ".content",
         "main",
         "article",
         "[role=main]",
-        ".product-detail",
-        ".product",
-        ".content",
-        ".container",
     ]
-    best = ""
-    for sel in candidates:
-        for el in soup.select(sel):
-            t = el.get_text(" ", strip=True)
-            if len(t) > len(best):
-                best = t
 
-    if not best:
-        best = soup.get_text(" ", strip=True)
+    # clone soup to remove UI elements
+    s2 = BeautifulSoup(str(soup), "lxml")
 
-    # Clean and shorten a bit (still enough for description)
-    best = re.sub(r"\s+", " ", best).strip()
-    if len(best) > 1800:
-        best = best[:1800].rsplit(" ", 1)[0] + "…"
+    # remove obvious UI blocks
+    for sel in [
+        "nav", "header", "footer", "aside", "form", "button",
+        ".breadcrumb", ".breadcrumbs", ".pagination", ".pager", ".nav",
+        ".header", ".footer", ".sidebar", ".cookie", ".consent", ".modal",
+    ]:
+        for el in s2.select(sel):
+            el.decompose()
 
-    return f"<p>{best}</p>" if best else ""
+    paras: list[str] = []
+    for sel in selectors:
+        for root in s2.select(sel):
+            # collect p and li
+            for p in root.select("p, li"):
+                txt = p.get_text(" ", strip=True)
+                if txt:
+                    paras.append(txt)
+        if len(paras) >= 5:
+            break
 
+    paras = _clean_paragraphs(paras)
+
+    # If still nothing, fall back to whole page text chunks
+    if not paras:
+        text = s2.get_text("\n", strip=True)
+        chunks = [c.strip() for c in text.split("\n") if c.strip()]
+        paras = _clean_paragraphs(chunks)
+
+    if not paras:
+        return ""
+
+    # limit size
+    out_paras = []
+    total = 0
+    for p in paras:
+        if total > 1200:
+            break
+        out_paras.append(p)
+        total += len(p)
+
+    return "".join([f"<p>{p}</p>" for p in out_paras])
+
+
+# --- playwright ---
 
 async def _auto_scroll(page, steps: int = 10, step_px: int = 900, wait_ms: int = 200):
     for _ in range(steps):
@@ -192,6 +275,8 @@ async def _fetch_with_login(url: str, user: str, password: str, wait_ms: int = 1
         return html, " ".join(note_parts)
 
 
+# --- scraper ---
+
 class PSIProductFinderScraper(Scraper):
     def can_handle(self, url: str) -> bool:
         return domain_of(url).endswith("psiproductfinder.de")
@@ -207,39 +292,33 @@ class PSIProductFinderScraper(Scraper):
         state = _parse_next_data(soup)
         title = None
         desc = None
-        images: list[str] = []
 
         if state:
             title = _find_first(state, {"name", "title", "productName", "product_title"})
             desc = _find_first(state, {"description", "longDescription", "shortDescription", "productDescription", "text"})
-            # images are in meta/img tags most times; keep light here
 
         if not title:
             title = _meta(soup, "og:title") or _meta(soup, "twitter:title") or (clean_text(soup.title.get_text()) if soup.title else "Produs")
 
+        # Description: prefer state (if long), else cleaned DOM extraction
         desc_html = ""
-        if desc and len(desc) > 40:
+        if desc and len(desc) > 80:
             desc_html = f"<p>{clean_text(desc)}</p>"
         else:
-            # Try meta, then biggest block fallback
-            meta_desc = _meta(soup, "og:description") or _meta(soup, "description")
-            desc_html = f"<p>{meta_desc}</p>" if meta_desc else ""
-            if not desc_html:
-                desc_html = _best_text_block_html(soup)
+            desc_html = _best_description_html(soup)
 
-        if not images:
-            images = _extract_images(soup, url)
+        images = _extract_images(soup, url)
 
         abs_imgs = []
         for u in images:
             if isinstance(u, str) and u:
                 abs_imgs.append(urljoin(url, u))
         seen = set()
-        out = []
+        out_imgs = []
         for u in abs_imgs:
             if u not in seen:
                 seen.add(u)
-                out.append(u)
+                out_imgs.append(u)
 
         return ProductDraft(
             source_url=url,
@@ -248,9 +327,9 @@ class PSIProductFinderScraper(Scraper):
             title=title,
             description_html=desc_html,
             short_description=clean_text(BeautifulSoup(desc_html or "", "lxml").get_text())[:200],
-            images=out[:12],
+            images=out_imgs[:12],
             price=None,
             currency="RON",
             needs_translation=False,
-            notes=f"psi_scraper=login_v2 parsed_with=playwright {note}",
+            notes=f"psi_scraper=login_v3_clean parsed_with=playwright {note}",
         )
