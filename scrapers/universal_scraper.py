@@ -282,4 +282,124 @@ class UniversalScraper:
             feature_selectors = [
                 '.product-features li',
                 '.features-list li',
-                
+                '.product-highlights li',
+                '.feature-item'
+            ]
+            
+            for selector in feature_selectors:
+                items = soup.select(selector)
+                for item in items:
+                    text = item.get_text(strip=True)
+                    if text and len(text) > 5:
+                        features.append(text)
+            
+            product['features'] = features[:20]  # Limit features
+            
+            # === EXTRACT SPECIFICATIONS ===
+            specs = {}
+            
+            # Look for specification tables
+            spec_tables = soup.select('.specifications table, .product-specs table, .details-table')
+            for table in spec_tables:
+                rows = table.select('tr')
+                for row in rows:
+                    cells = row.select('td, th')
+                    if len(cells) >= 2:
+                        key = cells[0].get_text(strip=True)
+                        value = cells[1].get_text(strip=True)
+                        if key and value:
+                            specs[key] = value
+            
+            # Look for definition lists
+            if not specs:
+                dl_elements = soup.select('dl.specifications, dl.product-specs')
+                for dl in dl_elements:
+                    dts = dl.select('dt')
+                    dds = dl.select('dd')
+                    for dt, dd in zip(dts, dds):
+                        key = dt.get_text(strip=True)
+                        value = dd.get_text(strip=True)
+                        if key and value:
+                            specs[key] = value
+            
+            product['specifications'] = specs
+            
+            # === EXTRACT MATERIALS ===
+            material = ""
+            material_patterns = [
+                r'Material[:\s]+([^\.]+)',
+                r'Fabric[:\s]+([^\.]+)',
+                r'Composition[:\s]+([^\.]+)'
+            ]
+            
+            for pattern in material_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    material = match.group(1).strip()
+                    break
+            
+            product['materials'] = material
+            
+            # === EXTRACT DIMENSIONS ===
+            dimensions = ""
+            dim_patterns = [
+                r'Dimensions[:\s]+([^\.]+)',
+                r'Size[:\s]+([^\.]+)',
+                r'Measurements[:\s]+([^\.]+)'
+            ]
+            
+            for pattern in dim_patterns:
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    dimensions = match.group(1).strip()
+                    break
+            
+            product['dimensions'] = dimensions
+            
+            # === EXTRACT COLORS/VARIANTS ===
+            variants = []
+            
+            # Look for color options
+            color_selectors = [
+                '.color-option',
+                '.variant-color',
+                '.color-selector button',
+                '[data-color]'
+            ]
+            
+            for selector in color_selectors:
+                colors = soup.select(selector)
+                for color in colors:
+                    variant = {
+                        'color': color.get('title') or color.get('data-color') or color.get_text(strip=True),
+                        'sku': color.get('data-sku', ''),
+                        'color_code': color.get('data-color-code', '')
+                    }
+                    if variant['color']:
+                        variants.append(variant)
+            
+            product['variants'] = variants[:20]  # Limit variants
+            
+            # === META TAGS ===
+            product['meta_title'] = product['name'][:70]
+            product['meta_description'] = product['description'][:160] if product['description'] else product['name'][:160]
+            
+            logger.info(f"Successfully extracted: {product['name']}")
+            return product
+            
+        except Exception as e:
+            logger.error(f"Error extracting from {url}: {e}")
+            return {
+                'url': url,
+                'status': 'error',
+                'error': str(e),
+                'name': f"Failed to extract from {url.split('/')[2]}",
+                'sku': f"ERROR_{hash(url) % 100000}",
+                'price': 0,
+                'description': '',
+                'images': [],
+                'brand': '',
+                'features': [],
+                'specifications': {},
+                'variants': []
+            }
