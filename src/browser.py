@@ -4,35 +4,40 @@ import asyncio
 import os
 import subprocess
 import sys
-from typing import Optional
 
 from playwright.async_api import async_playwright
 
 
-def _ensure_playwright_chromium_installed() -> None:
-    """Best-effort install of Playwright Chromium at runtime (Streamlit Cloud friendly).
+def _pw_writable_browsers_path() -> str:
+    # Streamlit Cloud allows writing under /home/adminuser
+    home = os.path.expanduser("~")
+    return os.path.join(home, ".cache", "ms-playwright")
 
-    This is a fallback in case `postBuild` didn't run or browsers cache was cleared.
-    It runs at most once per process using an env-flag.
+
+def _ensure_playwright_chromium_installed() -> None:
+    """Install Chromium browser for Playwright at runtime (best-effort).
+
+    We install into a **writable** cache path, not inside site-packages.
+    Runs at most once per process.
     """
     if os.environ.get("PW_CHROMIUM_READY") == "1":
         return
 
-    # Ensure browsers are installed in the project cache (not in a read-only path)
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+    browsers_path = _pw_writable_browsers_path()
+    os.makedirs(browsers_path, exist_ok=True)
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path
 
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        os.environ["PW_CHROMIUM_READY"] = "1"
-    except Exception:
-        # Don't hard-fail; caller will get original error if launch still fails
-        os.environ["PW_CHROMIUM_READY"] = "0"
+    # Install chromium only (no apt deps here)
+    proc = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"playwright_install_failed (code={proc.returncode}):\n{proc.stdout}")
+
+    os.environ["PW_CHROMIUM_READY"] = "1"
 
 
 async def render_html(url: str, wait_ms: int = 1500) -> str:
@@ -52,9 +57,8 @@ def render_html_sync(url: str, wait_ms: int = 1500) -> str:
         return asyncio.run(render_html(url, wait_ms=wait_ms))
     except Exception as e:
         msg = str(e)
-        # Most common Streamlit Cloud issue: browsers not downloaded
         if "Executable doesn't exist" in msg or "playwright install" in msg:
+            # Try install into writable cache and retry once
             _ensure_playwright_chromium_installed()
-            # retry once
             return asyncio.run(render_html(url, wait_ms=wait_ms))
         raise
