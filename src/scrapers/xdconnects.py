@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import re
-from urllib.parse import urlparse, quote, urljoin
+from urllib.parse import urlparse, quote, urljoin, parse_qs
 
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
@@ -101,7 +101,7 @@ def _extract_images_dom(soup: BeautifulSoup, base_url: str) -> list[str]:
         if u not in seen:
             seen.add(u)
             out.append(u)
-    return out[:12]
+    return out[:16]
 
 
 def _extract_desc(soup: BeautifulSoup) -> str:
@@ -115,7 +115,7 @@ def _extract_desc(soup: BeautifulSoup) -> str:
     )
     if ogd and len(ogd) > 40:
         return f"<p>{ogd}</p>"
-    # Try common containers (FIX: quotes escaped correctly)
+
     for sel in [
         ".product-description",
         '[itemprop="description"]',
@@ -126,6 +126,19 @@ def _extract_desc(soup: BeautifulSoup) -> str:
         if el and len(el.get_text(strip=True)) > 50:
             return str(el)
     return ""
+
+
+def _title_from_url(url: str) -> str:
+    p = urlparse(url)
+    slug = p.path.rstrip("/").split("/")[-1]
+    # remove query variantId etc
+    slug = re.sub(r"[-_]?p\d+\.\d+$", "", slug, flags=re.I)
+    slug = slug.replace("-", " ").replace("_", " ")
+    slug = re.sub(r"\s+", " ", slug).strip()
+    if not slug:
+        return "Produs"
+    # Title case but keep acronyms
+    return " ".join([w.upper() if w.isupper() and len(w) <= 4 else w.capitalize() for w in slug.split(" ")])
 
 
 async def _auto_scroll(page, steps: int = 10, step_px: int = 900, wait_ms: int = 200):
@@ -211,12 +224,8 @@ async def _fetch_with_login(url: str, email: str, password: str, wait_ms: int = 
 
 
 class XDConnectsScraper(Scraper):
-    def __init__(self):
-        pass
-
     def can_handle(self, url: str) -> bool:
-        d = domain_of(url)
-        return d.endswith("xdconnects.com")
+        return domain_of(url).endswith("xdconnects.com")
 
     def parse(self, url: str) -> ProductDraft:
         email = os.getenv("XD_USER", "").strip()
@@ -241,7 +250,7 @@ class XDConnectsScraper(Scraper):
         soup = BeautifulSoup(html, "lxml")
 
         page_title = clean_text(soup.title.get_text()) if soup.title else ""
-        if "403" in page_title.lower() or "access" in page_title.lower():
+        if "403" in page_title.lower() or "access not allowed" in page_title.lower():
             return ProductDraft(
                 source_url=url,
                 domain=domain_of(url),
@@ -257,6 +266,7 @@ class XDConnectsScraper(Scraper):
             )
 
         prod = _find_product_jsonld(soup)
+
         title = None
         sku = None
         price = None
@@ -268,17 +278,27 @@ class XDConnectsScraper(Scraper):
             price = _jsonld_get_price(prod)
             images = _jsonld_get_images(prod)
 
+        # Strong DOM fallbacks for title (XDConnects often has H1)
         if not title:
             title = (
                 _meta_content(soup, ['meta[property="og:title"]', 'meta[name="twitter:title"]'])
-                or _meta_content(soup, ['meta[name="title"]'])
-                or "Produs"
+                or clean_text((soup.select_one("h1") or soup.select_one(".page-title") or soup.select_one(".product-title") or soup.select_one(".product__title") or soup.select_one('[data-testid*="title" i]') or soup.select_one('[class*="title" i]')).get_text())
+                if (soup.select_one("h1") or soup.select_one(".page-title") or soup.select_one(".product-title") or soup.select_one(".product__title") or soup.select_one('[data-testid*="title" i]') or soup.select_one('[class*="title" i]')) else None
             )
+
+        if not title:
+            title = _title_from_url(url)
 
         desc_html = _extract_desc(soup) or "<p></p>"
 
         if not images:
             images = _extract_images_dom(soup, url)
+
+        # Extra hint: variantId from query (optional)
+        q = parse_qs(urlparse(url).query)
+        variant = q.get("variantId", [""])[0]
+
+        notes_extra = f"variantId={variant}" if variant else ""
 
         return ProductDraft(
             source_url=url,
@@ -291,5 +311,5 @@ class XDConnectsScraper(Scraper):
             price=price,
             currency="RON",
             needs_translation=False,
-            notes=f"parsed_with=playwright | {login_note} | xd_scraper=v1.1",
+            notes=f"parsed_with=playwright | {login_note} | xd_scraper=v1.2 | {notes_extra}".strip(),
         )
