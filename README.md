@@ -1,20 +1,50 @@
-# 🎒 Product Importer pentru Gomag
+# 🛒 Import Automatizat Produse în Gomag
 
-Sistem automatizat pentru importul produselor din diverse site-uri de furnizori în platforma Gomag.
+Aplicație Streamlit pentru importul automatizat de produse din diverse surse în platforma Gomag.
 
 ## ✨ Funcționalități
 
-- 📤 Încărcare link-uri din fișiere Excel/CSV sau manual
-- 🔍 Extragere automată a informațiilor despre produse
-- 🌍 Traducere automată în limba română
-- 📷 Descărcare și optimizare imagini
-- 🎨 Suport pentru variante (culori, mărimi)
+- 📤 Upload link-uri din Excel/CSV sau manual
+- 🔍 Scraping automat cu CloudScraper (bypass Cloudflare)
+- 🌍 Traducere automată în română
+- 📁 Gestionare categorii Gomag
 - 🚀 Import automat în Gomag
-- 📊 Export rapoarte (Excel, CSV, JSON)
+- 📊 Raportare și export
 
-## 🛠️ Instalare
+## 🌐 Site-uri Suportate
 
-### 1. Clonează repository-ul
+- xdconnects.com
+- pfconcept.com
+- midocean.com
+- promobox.com
+- andapresent.com
+- psiproductfinder.de
+- stamina-shop.eu
+- utteam.com
+- clipperinterall.com
+- sipec.com
+- stricker-europe.com
+
+## 🚀 Instalare
+
+### Local
+
 ```bash
-git clone https://github.com/YOUR_USERNAME/product-importer.git
+# Clonează repository
+git clone https://github.com/username/product-importer.git
 cd product-importer
+
+# Creează environment virtual
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+venv\Scripts\activate     # Windows
+
+# Instalează dependențele
+pip install -r requirements.txt
+
+# Configurează secrets
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+# Editează secrets.toml cu credențialele tale
+
+# Rulează aplicația
+streamlit run app.py
