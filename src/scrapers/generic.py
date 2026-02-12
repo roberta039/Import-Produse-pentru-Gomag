@@ -35,12 +35,27 @@ def _extract_images_basic(soup: BeautifulSoup, base_url: str) -> list[str]:
     return out[:12]
 
 
+def _meta_content(soup: BeautifulSoup, selectors: list[str]) -> str:
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if el and el.get("content") and clean_text(el.get("content")):
+            return clean_text(el.get("content"))
+    return ""
+
+
 def _extract_title_basic(soup: BeautifulSoup) -> str:
+    # Prefer OpenGraph/Twitter titles (fixes sites where H1 is missing)
+    og = _meta_content(soup, ['meta[property="og:title"]', 'meta[name="twitter:title"]'])
+    if og:
+        return og
+
     h1 = soup.select_one("h1")
     if h1 and clean_text(h1.get_text()):
         return clean_text(h1.get_text())
+
     if soup.title and clean_text(soup.title.get_text()):
         return clean_text(soup.title.get_text())
+
     return "Produs"
 
 
@@ -57,6 +72,11 @@ def _extract_price_basic(soup: BeautifulSoup) -> float | None:
 
 
 def _extract_desc_basic(soup: BeautifulSoup) -> str:
+    # Prefer OG description if available (fixes menu/noise text)
+    ogd = _meta_content(soup, ['meta[property="og:description"]', 'meta[name="description"]', 'meta[name="twitter:description"]'])
+    if ogd and len(ogd) > 40:
+        return f"<p>{ogd}</p>"
+
     for sel in [
         '[itemprop="description"]',
         ".product-description",
@@ -106,8 +126,10 @@ def _find_product_jsonld(soup: BeautifulSoup) -> dict | None:
         graph = obj.get("@graph")
         if isinstance(graph, list):
             for node in graph:
-                if isinstance(node, dict) and node.get("@type") == "Product":
-                    return node
+                if isinstance(node, dict):
+                    nt = node.get("@type")
+                    if nt == "Product" or (isinstance(nt, list) and "Product" in nt):
+                        return node
     return None
 
 
@@ -170,7 +192,6 @@ class GenericScraper(Scraper):
                 html = render_html_sync(url, wait_ms=2500)
                 method = "playwright"
             except Exception as e:
-                # IMPORTANT: nu mai ascundem eroarea, o punem in notes
                 pw_error = f"playwright_failed={type(e).__name__}: {e}"
 
         soup = BeautifulSoup(html, "lxml")
@@ -208,7 +229,7 @@ class GenericScraper(Scraper):
                     sku = clean_text(el.get_text())
                     break
 
-        notes_parts = [f"generic=v4-jsonld", f"parsed_with={method}"]
+        notes_parts = [f"generic=v5-meta+jsonld", f"parsed_with={method}"]
         if tried_playwright and method != "playwright":
             notes_parts.append("playwright_tried=YES")
         if pw_error:
