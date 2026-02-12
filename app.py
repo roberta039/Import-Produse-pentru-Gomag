@@ -1,5 +1,13 @@
 from __future__ import annotations
 import streamlit as st
+# --- PSI ProductFinder creds -> env (for scrapers) ---
+import os as _os
+try:
+    _os.environ["PSI_USER"] = str(st.secrets.get("SOURCES", {}).get("PSI_USER", "")).strip()
+    _os.environ["PSI_PASS"] = str(st.secrets.get("SOURCES", {}).get("PSI_PASS", "")).strip()
+except Exception:
+    pass
+
 # --- XDConnects creds -> env (for scrapers) ---
 import os as _os
 try:
