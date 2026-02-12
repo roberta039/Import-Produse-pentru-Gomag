@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from urllib.parse import urljoin
 
@@ -12,7 +13,7 @@ from ..models import ProductDraft
 from ..utils import clean_text, domain_of, ensure_sku
 
 
-def _extract_images(soup: BeautifulSoup, base_url: str) -> list[str]:
+def _extract_images_basic(soup: BeautifulSoup, base_url: str) -> list[str]:
     imgs: list[str] = []
     for img in soup.select("img"):
         src = img.get("src") or img.get("data-src") or img.get("data-original")
@@ -35,7 +36,7 @@ def _extract_images(soup: BeautifulSoup, base_url: str) -> list[str]:
     return out[:12]
 
 
-def _extract_title(soup: BeautifulSoup) -> str:
+def _extract_title_basic(soup: BeautifulSoup) -> str:
     h1 = soup.select_one("h1")
     if h1 and clean_text(h1.get_text()):
         return clean_text(h1.get_text())
@@ -44,7 +45,7 @@ def _extract_title(soup: BeautifulSoup) -> str:
     return "Produs"
 
 
-def _extract_price(soup: BeautifulSoup) -> float | None:
+def _extract_price_basic(soup: BeautifulSoup) -> float | None:
     # heuristic: find first price-like pattern
     text = soup.get_text(" ", strip=True)
     m = re.search(r"(\d+[\.,]?\d*)\s*(lei|ron|eur|€)", text, re.IGNORECASE)
@@ -57,7 +58,7 @@ def _extract_price(soup: BeautifulSoup) -> float | None:
         return None
 
 
-def _extract_desc(soup: BeautifulSoup) -> str:
+def _extract_desc_basic(soup: BeautifulSoup) -> str:
     for sel in [
         '[itemprop="description"]',
         ".product-description",
@@ -79,6 +80,91 @@ def _extract_desc(soup: BeautifulSoup) -> str:
         if len(t) > len(best) and len(t) > 80:
             best = t
     return f"<p>{best}</p>" if best else ""
+
+
+def _iter_jsonld_objects(soup: BeautifulSoup):
+    for sc in soup.select('script[type="application/ld+json"]'):
+        raw = sc.string or sc.get_text() or ""
+        raw = raw.strip()
+        if not raw:
+            continue
+        # Some sites put multiple JSON objects without a list; try best-effort parsing.
+        try:
+            data = json.loads(raw)
+        except Exception:
+            # attempt to fix trailing garbage
+            continue
+
+        # normalize to list of objects
+        if isinstance(data, dict):
+            yield data
+        elif isinstance(data, list):
+            for obj in data:
+                if isinstance(obj, dict):
+                    yield obj
+
+
+def _find_product_jsonld(soup: BeautifulSoup) -> dict | None:
+    # Return the first JSON-LD node describing a Product
+    for obj in _iter_jsonld_objects(soup):
+        # direct Product
+        t = obj.get("@type") or obj.get("type")
+        if isinstance(t, list):
+            if "Product" in t:
+                return obj
+        if t == "Product":
+            return obj
+
+        # graph
+        graph = obj.get("@graph")
+        if isinstance(graph, list):
+            for node in graph:
+                if not isinstance(node, dict):
+                    continue
+                nt = node.get("@type")
+                if isinstance(nt, list):
+                    if "Product" in nt:
+                        return node
+                if nt == "Product":
+                    return node
+    return None
+
+
+def _jsonld_get_images(prod: dict) -> list[str]:
+    imgs = prod.get("image")
+    out: list[str] = []
+    if isinstance(imgs, str):
+        out = [imgs]
+    elif isinstance(imgs, list):
+        out = [x for x in imgs if isinstance(x, str)]
+    # dedupe
+    seen = set()
+    res = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            res.append(u)
+    return res
+
+
+def _jsonld_get_price(prod: dict) -> float | None:
+    offers = prod.get("offers")
+    if isinstance(offers, dict):
+        p = offers.get("price")
+        if p is None:
+            return None
+        try:
+            return float(str(p).replace(",", "."))
+        except Exception:
+            return None
+    if isinstance(offers, list) and offers:
+        for o in offers:
+            if isinstance(o, dict) and o.get("price") is not None:
+                try:
+                    return float(str(o.get("price")).replace(",", "."))
+                except Exception:
+                    continue
+    return None
 
 
 class GenericScraper(Scraper):
@@ -113,26 +199,51 @@ class GenericScraper(Scraper):
 
         soup = BeautifulSoup(html, "lxml")
 
-        title = _extract_title(soup)
-        price = _extract_price(soup)
-        desc_html = _extract_desc(soup)
-        images = _extract_images(soup, url)
-
+        # Prefer JSON-LD Product data if available (fixes many sites with complex layouts)
+        prod = _find_product_jsonld(soup)
+        title = None
+        desc_html = None
+        images = None
         sku = None
-        for sel in ['[itemprop="sku"]', ".sku", ".product-sku", "#sku"]:
-            el = soup.select_one(sel)
-            if el and clean_text(el.get_text()):
-                sku = clean_text(el.get_text())
-                break
+        price = None
+
+        if prod:
+            title = clean_text(str(prod.get("name") or "")) or None
+            sku = clean_text(str(prod.get("sku") or "")) or None
+
+            # description in JSON-LD is plain text; wrap in <p>
+            d = prod.get("description")
+            if isinstance(d, str) and clean_text(d):
+                desc_html = f"<p>{clean_text(d)}</p>"
+            images = _jsonld_get_images(prod) or None
+            price = _jsonld_get_price(prod)
+
+        # Fallbacks
+        if not title:
+            title = _extract_title_basic(soup)
+        if not desc_html:
+            desc_html = _extract_desc_basic(soup)
+        if images is None:
+            images = _extract_images_basic(soup, url)
+        if price is None:
+            price = _extract_price_basic(soup)
+
+        # Fallback SKU extraction from DOM
+        if not sku:
+            for sel in ['[itemprop="sku"]', ".sku", ".product-sku", "#sku"]:
+                el = soup.select_one(sel)
+                if el and clean_text(el.get_text()):
+                    sku = clean_text(el.get_text())
+                    break
 
         return ProductDraft(
             source_url=url,
             domain=domain,
             sku=ensure_sku(url, sku),
             title=title,
-            description_html=desc_html,
-            short_description=clean_text(BeautifulSoup(desc_html, "lxml").get_text())[:200],
-            images=images,
+            description_html=desc_html or "",
+            short_description=clean_text(BeautifulSoup(desc_html or "", "lxml").get_text())[:200],
+            images=images or [],
             price=price,
             currency="RON",
             needs_translation=False,
