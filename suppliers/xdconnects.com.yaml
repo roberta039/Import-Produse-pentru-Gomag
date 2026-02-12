@@ -1,6 +1,0 @@
-title_css: "h1"
-description_css: ".product-description, [data-testid='product-description'], #product-description"
-sku_css: ".sku, .product-sku, [data-testid='sku']"
-price_css: ".price, .product-price, [data-testid='price']"
-image_css: "meta[property='og:image'], img"
-image_attr: "content"
