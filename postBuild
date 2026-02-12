@@ -1,3 +1,6 @@
 #!/usr/bin/env bash
 set -e
-python -m playwright install chromium
+
+# Ensure browsers are downloaded during build
+export PLAYWRIGHT_BROWSERS_PATH=0
+python -m playwright install --with-deps chromium
