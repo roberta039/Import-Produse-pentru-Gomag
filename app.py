@@ -1,314 +1,656 @@
-import requests
-from bs4 import BeautifulSoup
+import streamlit as st
+import pandas as pd
 import json
+import os
+from datetime import datetime
+from io import BytesIO
+import time
+from typing import List, Dict
 import logging
-from typing import Dict, List, Optional
-import re
 
+# Import module custom
+from gomag.api import GomagAPI
+from scrapers.universal import UniversalScraper
+from utils.translator import Translator
+from utils.data_processor import DataProcessor
+
+# Configurare logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class GomagAPI:
-    """API pentru interacțiunea cu platforma Gomag"""
+# Configurare pagină
+st.set_page_config(
+    page_title="🎒 Gomag Product Importer",
+    page_icon="🎒",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# CSS Custom
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        background: linear-gradient(90deg, #1E88E5 0%, #1976D2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        text-align: center;
+        padding: 1rem 0;
+    }
+    .success-box {
+        background-color: #d4edda;
+        border: 1px solid #c3e6cb;
+        color: #155724;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+    }
+    .category-tree {
+        background: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        max-height: 400px;
+        overflow-y: auto;
+    }
+    .category-item {
+        padding: 0.5rem;
+        margin: 0.2rem 0;
+        cursor: pointer;
+        border-radius: 0.3rem;
+    }
+    .category-item:hover {
+        background: #e9ecef;
+    }
+    .category-selected {
+        background: #1E88E5 !important;
+        color: white;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize session state
+if 'gomag_api' not in st.session_state:
+    st.session_state.gomag_api = None
+if 'categories' not in st.session_state:
+    st.session_state.categories = []
+if 'selected_category' not in st.session_state:
+    st.session_state.selected_category = None
+if 'products' not in st.session_state:
+    st.session_state.products = []
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+
+def render_category_tree(categories: List[Dict], parent_id: int = 0, level: int = 0) -> None:
+    """Randează arborele de categorii"""
+    for cat in categories:
+        if cat.get('parent_id') == parent_id:
+            indent = "　" * level  # Indentare vizuală
+            
+            # Buton pentru selectare categorie
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                if st.button(
+                    f"{indent}📁 {cat['name']}", 
+                    key=f"cat_{cat['id']}",
+                    use_container_width=True
+                ):
+                    st.session_state.selected_category = cat
+                    st.rerun()
+            
+            with col2:
+                if cat.get('local'):
+                    st.caption("🔸 Local")
+            
+            # Randează subcategoriile
+            render_category_tree(categories, cat['id'], level + 1)
+
+def main():
+    st.markdown('<h1 class="main-header">🎒 Gomag Product Importer</h1>', unsafe_allow_html=True)
     
-    def __init__(self, domain: str):
-        self.domain = domain
-        self.base_url = f"https://{domain}"
-        self.session = requests.Session()
-        self.authenticated = False
-        self.categories_cache = None
+    # Sidebar - Configurare
+    with st.sidebar:
+        st.header("⚙️ Configurare")
         
-        # Headers pentru a simula un browser
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7',
-        })
-    
-    def test_connection(self) -> bool:
-        """Testează conexiunea la Gomag"""
-        try:
-            response = self.session.get(self.base_url, timeout=10)
-            return response.status_code == 200
-        except Exception as e:
-            logger.error(f"Connection test failed: {e}")
-            return False
-    
-    def login(self, username: str, password: str) -> bool:
-        """Autentificare în Gomag"""
-        try:
-            # Obține pagina de login pentru CSRF token
-            login_url = f"{self.base_url}/admin/login"
-            response = self.session.get(login_url)
+        # Conexiune Gomag
+        st.subheader("🔐 Conectare Gomag")
+        
+        domain = st.text_input(
+            "Domeniu Gomag",
+            value=os.getenv("GOMAG_DOMAIN", "rucsacantifurtro.gomag.ro"),
+            help="Exemplu: magazin.gomag.ro"
+        )
+        
+        if st.button("🔍 Test Conexiune"):
+            api = GomagAPI(domain)
+            if api.test_connection():
+                st.success(f"✅ Conexiune reușită la {domain}")
+                st.session_state.gomag_api = api
+            else:
+                st.error("❌ Nu se poate conecta")
+        
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        
+        if st.button("🔓 Autentificare", type="primary"):
+            if not st.session_state.gomag_api:
+                st.session_state.gomag_api = GomagAPI(domain)
             
-            if response.status_code != 200:
-                login_url = f"{self.base_url}/login"
-                response = self.session.get(login_url)
-            
-            # Extrage CSRF token dacă există
-            csrf_token = None
-            soup = BeautifulSoup(response.text, 'html.parser')
-            csrf_input = soup.find('input', {'name': re.compile('csrf|token', re.I)})
-            if csrf_input:
-                csrf_token = csrf_input.get('value')
-            
-            # Date de autentificare
-            login_data = {
-                'username': username,
-                'password': password
-            }
-            
-            if csrf_token:
-                login_data['csrf_token'] = csrf_token
-            
-            # Trimite cererea de autentificare
-            response = self.session.post(login_url, data=login_data)
-            
-            # Verifică succesul
-            if 'dashboard' in response.url.lower() or 'admin' in response.url.lower():
-                self.authenticated = True
-                logger.info("Successfully authenticated to Gomag")
-                return True
-            
-            # Try API authentication
-            api_url = f"{self.base_url}/api/auth"
-            api_response = self.session.post(api_url, json={
-                'username': username,
-                'password': password
-            })
-            
-            if api_response.status_code == 200:
-                self.authenticated = True
-                return True
+            if st.session_state.gomag_api.login(username, password):
+                st.session_state.authenticated = True
+                st.success("✅ Autentificat cu succes!")
                 
-            return False
-            
-        except Exception as e:
-            logger.error(f"Login failed: {e}")
-            return False
-    
-    def get_categories(self) -> List[Dict]:
-        """Obține lista de categorii din Gomag"""
-        if self.categories_cache:
-            return self.categories_cache
+                # Încarcă categoriile
+                with st.spinner("Se încarcă categoriile..."):
+                    st.session_state.categories = st.session_state.gomag_api.get_categories()
+                st.rerun()
+            else:
+                st.error("❌ Autentificare eșuată")
         
-        try:
-            # Încearcă mai multe endpoint-uri posibile
-            endpoints = [
-                f"{self.base_url}/api/categories",
-                f"{self.base_url}/admin/categories/list",
-                f"{self.base_url}/categories.json"
-            ]
-            
-            for endpoint in endpoints:
-                try:
-                    response = self.session.get(endpoint, timeout=10)
-                    if response.status_code == 200:
-                        try:
-                            categories = response.json()
-                            if isinstance(categories, list):
-                                self.categories_cache = categories
-                                return categories
-                        except:
-                            pass
-                except:
-                    continue
-            
-            # Dacă API-ul nu funcționează, încearcă web scraping
-            return self._scrape_categories()
-            
-        except Exception as e:
-            logger.error(f"Failed to get categories: {e}")
-            return []
-    
-    def _scrape_categories(self) -> List[Dict]:
-        """Extrage categoriile prin web scraping"""
-        categories = []
+        if st.session_state.authenticated:
+            st.success("✅ Conectat la Gomag")
         
-        try:
-            # Categorii hardcodate comune pentru magazine online românești
-            default_categories = [
-                {"id": 1, "name": "Rucsacuri", "parent_id": 0, "path": "rucsacuri"},
-                {"id": 2, "name": "Rucsacuri Anti-Furt", "parent_id": 1, "path": "rucsacuri/anti-furt"},
-                {"id": 3, "name": "Rucsacuri Laptop", "parent_id": 1, "path": "rucsacuri/laptop"},
-                {"id": 4, "name": "Rucsacuri Călătorie", "parent_id": 1, "path": "rucsacuri/calatorie"},
-                {"id": 5, "name": "Genți", "parent_id": 0, "path": "genti"},
-                {"id": 6, "name": "Genți Laptop", "parent_id": 5, "path": "genti/laptop"},
-                {"id": 7, "name": "Accesorii", "parent_id": 0, "path": "accesorii"},
-                {"id": 8, "name": "Accesorii Securitate", "parent_id": 7, "path": "accesorii/securitate"},
-                {"id": 9, "name": "Produse Noi", "parent_id": 0, "path": "produse-noi"},
-                {"id": 10, "name": "Promoții", "parent_id": 0, "path": "promotii"}
-            ]
+        # Mod local
+        st.divider()
+        use_local = st.checkbox("💾 Mod Local (fără autentificare)")
+        if use_local:
+            st.session_state.authenticated = True
+            if not st.session_state.gomag_api:
+                st.session_state.gomag_api = GomagAPI("local.gomag.ro")
+            if not st.session_state.categories:
+                st.session_state.categories = st.session_state.gomag_api.get_categories()
+        
+        # Setări Import
+        st.divider()
+        st.subheader("📦 Setări Import")
+        
+        translate_enabled = st.checkbox("🌍 Traduce în Română", value=True)
+        if translate_enabled:
+            source_lang = st.selectbox("Limba sursă", ["en", "de", "fr", "it", "es"])
+        
+        price_markup = st.number_input(
+            "💰 Adaos comercial (%)",
+            min_value=0,
+            max_value=200,
+            value=30,
+            step=5
+        )
+        
+        currency_rate = st.number_input(
+            "💱 Curs EUR → RON",
+            min_value=4.0,
+            max_value=6.0,
+            value=4.95,
+            step=0.01
+        )
+        
+        stock_default = st.number_input(
+            "📦 Stoc implicit",
+            min_value=0,
+            max_value=1000,
+            value=100
+        )
+    
+    # Main content
+    tabs = st.tabs([
+        "📁 Categorii",
+        "📤 Încărcare Produse", 
+        "🔍 Procesare",
+        "📥 Import Gomag",
+        "📊 Rapoarte"
+    ])
+    
+    # Tab 1: Categorii
+    with tabs[0]:
+        st.header("📁 Gestionare Categorii")
+        
+        if not st.session_state.categories:
+            st.warning("⚠️ Te rog să te autentifici pentru a vedea categoriile")
+        else:
+            col1, col2 = st.columns([2, 3])
             
-            # Încearcă să obțină categoriile de pe site
-            try:
-                response = self.session.get(f"{self.base_url}/sitemap.xml", timeout=10)
-                if response.status_code == 200:
-                    # Parse sitemap pentru categorii
-                    soup = BeautifulSoup(response.content, 'xml')
-                    urls = soup.find_all('url')
+            with col1:
+                st.subheader("🌳 Categorii Existente")
+                
+                # Afișare arbore categorii
+                with st.container():
+                    st.markdown('<div class="category-tree">', unsafe_allow_html=True)
+                    render_category_tree(st.session_state.categories)
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                # Adaugă categorie nouă
+                st.divider()
+                st.subheader("➕ Adaugă Categorie Nouă")
+                
+                new_cat_name = st.text_input("Nume categorie")
+                
+                parent_options = {"0": "Categorie principală"}
+                for cat in st.session_state.categories:
+                    parent_options[str(cat['id'])] = cat['name']
+                
+                parent_id = st.selectbox(
+                    "Categorie părinte",
+                    options=list(parent_options.keys()),
+                    format_func=lambda x: parent_options[x]
+                )
+                
+                if st.button("➕ Creează Categorie", type="primary"):
+                    if new_cat_name and st.session_state.gomag_api:
+                        new_cat = st.session_state.gomag_api.create_category(
+                            new_cat_name,
+                            int(parent_id)
+                        )
+                        if new_cat:
+                            st.session_state.categories.append(new_cat)
+                            st.success(f"✅ Categoria '{new_cat_name}' a fost creată!")
+                            time.sleep(1)
+                            st.rerun()
+            
+            with col2:
+                if st.session_state.selected_category:
+                    st.subheader(f"📋 Detalii: {st.session_state.selected_category['name']}")
                     
+                    # Afișare detalii categorie
+                    st.json({
+                        "ID": st.session_state.selected_category.get('id'),
+                        "Nume": st.session_state.selected_category.get('name'),
+                        "Path": st.session_state.selected_category.get('path'),
+                        "Parent ID": st.session_state.selected_category.get('parent_id'),
+                        "Local": st.session_state.selected_category.get('local', False)
+                    })
+                    
+                    # Statistici categorie
+                    st.divider()
+                    st.subheader("📊 Statistici")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        # Număr produse în categorie
+                        products_in_cat = len([
+                            p for p in st.session_state.products 
+                            if p.get('category_id') == st.session_state.selected_category['id']
+                        ])
+                        st.metric("Produse", products_in_cat)
+                    
+                    with col2:
+                        # Subcategorii
+                        subcats = len([
+                            c for c in st.session_state.categories
+                            if c.get('parent_id') == st.session_state.selected_category['id']
+                        ])
+                        st.metric("Subcategorii", subcats)
+                    
+                    with col3:
+                        # Status
+                        status = "✅ Sincronizat" if not st.session_state.selected_category.get('local') else "🔸 Local"
+                        st.metric("Status", status)
+                else:
+                    st.info("👈 Selectează o categorie pentru a vedea detaliile")
+    
+    # Tab 2: Încărcare Produse
+    with tabs[1]:
+        st.header("📤 Încărcare Produse")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("📁 Din Excel/CSV")
+            
+            uploaded_file = st.file_uploader(
+                "Încarcă fișier",
+                type=['xlsx', 'xls', 'csv'],
+                help="Fișierul trebuie să conțină coloana 'url' sau 'link'"
+            )
+            
+            if uploaded_file:
+                try:
+                    if uploaded_file.name.endswith('.csv'):
+                        df = pd.read_csv(uploaded_file)
+                    else:
+                        df = pd.read_excel(uploaded_file)
+                    
+                    st.success(f"✅ Fișier încărcat: {len(df)} rânduri")
+                    
+                    # Preview
+                    with st.expander("👁️ Preview date"):
+                        st.dataframe(df.head())
+                    
+                    # Selectare coloană URL
+                    url_column = st.selectbox(
+                        "Selectează coloana cu URL-uri",
+                        options=df.columns.tolist()
+                    )
+                    
+                    # Selectare categorie pentru import
+                    if st.session_state.categories:
+                        cat_names = {str(c['id']): c['name'] for c in st.session_state.categories}
+                        selected_cat_id = st.selectbox(
+                            "Categoria pentru aceste produse",
+                            options=list(cat_names.keys()),
+                            format_func=lambda x: cat_names[x]
+                        )
+                    else:
+                        selected_cat_id = None
+                    
+                    if st.button("📥 Importă URL-uri", type="primary"):
+                        urls = df[url_column].dropna().tolist()
+                        for url in urls:
+                            if url and not any(p['url'] == url for p in st.session_state.products):
+                                st.session_state.products.append({
+                                    'url': url,
+                                    'status': 'pending',
+                                    'category_id': selected_cat_id,
+                                    'added_at': datetime.now().isoformat()
+                                })
+                        st.success(f"✅ Am adăugat {len(urls)} produse")
+                        time.sleep(1)
+                        st.rerun()
+                        
+                except Exception as e:
+                    st.error(f"❌ Eroare: {e}")
+        
+        with col2:
+            st.subheader("✍️ Adăugare Manuală")
+            
+            urls_text = st.text_area(
+                "URL-uri (unul per linie)",
+                height=200,
+                placeholder="https://www.xdconnects.com/...\nhttps://www.pfconcept.com/..."
+            )
+            
+            # Selectare categorie
+            if st.session_state.categories:
+                cat_names_manual = {str(c['id']): c['name'] for c in st.session_state.categories}
+                manual_cat_id = st.selectbox(
+                    "Categoria pentru produse",
+                    options=list(cat_names_manual.keys()),
+                    format_func=lambda x: cat_names_manual[x],
+                    key="manual_cat"
+                )
+            else:
+                manual_cat_id = None
+            
+            if st.button("➕ Adaugă", type="primary", key="add_manual"):
+                if urls_text:
+                    urls = [u.strip() for u in urls_text.split('\n') if u.strip()]
+                    added = 0
                     for url in urls:
-                        loc = url.find('loc')
-                        if loc and '/category/' in loc.text or '/categorie/' in loc.text:
-                            path = loc.text.split('/')[-1]
-                            name = path.replace('-', ' ').title()
-                            categories.append({
-                                "id": len(categories) + 100,
-                                "name": name,
-                                "parent_id": 0,
-                                "path": path
+                        if not any(p['url'] == url for p in st.session_state.products):
+                            st.session_state.products.append({
+                                'url': url,
+                                'status': 'pending',
+                                'category_id': manual_cat_id,
+                                'added_at': datetime.now().isoformat()
                             })
-            except:
-                pass
+                            added += 1
+                    st.success(f"✅ Am adăugat {added} produse")
+                    time.sleep(1)
+                    st.rerun()
+        
+        # Lista produse
+        st.divider()
+        if st.session_state.products:
+            st.subheader(f"📦 Produse încărcate ({len(st.session_state.products)})")
             
-            # Dacă nu găsește nimic, returnează categoriile implicite
-            if not categories:
-                categories = default_categories
+            # Filtre
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                filter_status = st.selectbox(
+                    "Filtrează după status",
+                    ["Toate", "În așteptare", "Procesate", "Erori"]
+                )
+            with col2:
+                filter_category = st.selectbox(
+                    "Filtrează după categorie",
+                    ["Toate"] + [c['name'] for c in st.session_state.categories]
+                )
+            with col3:
+                if st.button("🗑️ Șterge toate"):
+                    st.session_state.products = []
+                    st.rerun()
             
-            self.categories_cache = categories
-            return categories
-            
-        except Exception as e:
-            logger.error(f"Failed to scrape categories: {e}")
-            return []
-    
-    def create_category(self, name: str, parent_id: int = 0) -> Optional[Dict]:
-        """Creează o categorie nouă"""
-        try:
-            # Endpoint-uri posibile pentru creare categorie
-            endpoints = [
-                f"{self.base_url}/api/categories",
-                f"{self.base_url}/admin/categories/create"
-            ]
-            
-            category_data = {
-                "name": name,
-                "parent_id": parent_id,
-                "status": 1,
-                "sort_order": 0,
-                "meta_title": name,
-                "meta_description": f"Produse din categoria {name}",
-                "slug": self._create_slug(name)
-            }
-            
-            for endpoint in endpoints:
-                try:
-                    response = self.session.post(
-                        endpoint,
-                        json=category_data,
-                        timeout=10
-                    )
+            # Afișare produse
+            for i, product in enumerate(st.session_state.products):
+                # Aplică filtre
+                if filter_status != "Toate":
+                    status_map = {
+                        "În așteptare": "pending",
+                        "Procesate": "processed",
+                        "Erori": "error"
+                    }
+                    if product.get('status') != status_map.get(filter_status):
+                        continue
+                
+                with st.expander(f"{product.get('name', product['url'][:50])}..."):
+                    col1, col2, col3 = st.columns([2, 1, 1])
                     
-                    if response.status_code in [200, 201]:
-                        result = response.json()
-                        new_category = {
-                            "id": result.get('id', len(self.categories_cache) + 1),
-                            "name": name,
-                            "parent_id": parent_id,
-                            "path": category_data['slug']
+                    with col1:
+                        st.write(f"**URL:** {product['url']}")
+                        st.write(f"**Status:** {product.get('status', 'pending')}")
+                        if product.get('category_id'):
+                            cat = next((c for c in st.session_state.categories if str(c['id']) == str(product['category_id'])), None)
+                            if cat:
+                                st.write(f"**Categorie:** {cat['name']}")
+                    
+                    with col2:
+                        if product.get('name'):
+                            st.write(f"**Nume:** {product['name']}")
+                        if product.get('sku'):
+                            st.write(f"**SKU:** {product['sku']}")
+                        if product.get('price'):
+                            st.write(f"**Preț:** {product['price']} {product.get('currency', 'EUR')}")
+                    
+                    with col3:
+                        if st.button(f"🗑️ Șterge", key=f"del_{i}"):
+                            st.session_state.products.pop(i)
+                            st.rerun()
+    
+    # Tab 3: Procesare
+    with tabs[2]:
+        st.header("🔍 Procesare Produse")
+        
+        pending = [p for p in st.session_state.products if p.get('status') == 'pending']
+        
+        if not pending:
+            st.info("📭 Nu există produse de procesat")
+        else:
+            st.success(f"📦 {len(pending)} produse în așteptare")
+            
+            if st.button("🚀 Procesează Toate", type="primary"):
+                progress = st.progress(0)
+                status_text = st.empty()
+                scraper = UniversalScraper()
+                
+                for i, product in enumerate(st.session_state.products):
+                    if product['status'] == 'pending':
+                        progress.progress((i+1) / len(st.session_state.products))
+                        status_text.text(f"Procesez: {product['url'][:50]}...")
+                        
+                        # Extract info
+                        extracted = scraper.extract(product['url'])
+                        
+                        # Update product
+                        product.update(extracted)
+                        product['status'] = 'processed'
+                        
+                        # Translate if needed
+                        if translate_enabled:
+                            translator = Translator(source_lang, 'ro')
+                            product = translator.translate_product(product)
+                        
+                        # Apply markup
+                        if product.get('price'):
+                            product['price'] = product['price'] * (1 + price_markup/100)
+                            product['price_ron'] = product['price'] * currency_rate
+                        
+                        time.sleep(0.5)
+                
+                progress.progress(1.0)
+                status_text.text("✅ Procesare completă!")
+                st.rerun()
+    
+    # Tab 4: Import Gomag
+    with tabs[3]:
+        st.header("📥 Import în Gomag")
+        
+        processed = [p for p in st.session_state.products if p.get('status') == 'processed']
+        
+        if not processed:
+            st.warning("⚠️ Nu există produse procesate pentru import")
+        else:
+            st.success(f"✅ {len(processed)} produse gata pentru import")
+            
+            # Opțiuni import
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                import_images = st.checkbox("📷 Importă imagini", value=True)
+                create_variants = st.checkbox("🎨 Creează variante", value=True)
+                set_active = st.checkbox("✅ Activează produsele", value=True)
+            
+            with col2:
+                use_special_price = st.checkbox("💰 Folosește preț special")
+                if use_special_price:
+                    discount = st.slider("Discount (%)", 0, 50, 10)
+            
+            if st.button("🚀 Începe Importul", type="primary"):
+                if not st.session_state.gomag_api:
+                    st.error("❌ Nu ești conectat la Gomag")
+                else:
+                    progress = st.progress(0)
+                    results = []
+                    
+                    for i, product in enumerate(processed):
+                        progress.progress((i+1) / len(processed))
+                        
+                        # Pregătește date pentru import
+                        import_data = {
+                            'name': product.get('name'),
+                            'sku': product.get('sku'),
+                            'price': product.get('price_ron', product.get('price', 0)),
+                            'description': product.get('description'),
+                            'category_id': product.get('category_id'),
+                            'brand': product.get('brand'),
+                            'images': product.get('images', []),
+                            'stock': stock_default,
+                            'status': 1 if set_active else 0
                         }
                         
-                        # Adaugă în cache
-                        if self.categories_cache:
-                            self.categories_cache.append(new_category)
+                        if use_special_price:
+                            import_data['special_price'] = import_data['price'] * (1 - discount/100)
                         
-                        return new_category
-                except:
-                    continue
-            
-            # Dacă nu poate crea prin API, adaugă local
-            new_category = {
-                "id": f"local_{len(self.categories_cache or [])+1}",
-                "name": name,
-                "parent_id": parent_id,
-                "path": self._create_slug(name),
-                "local": True
-            }
-            
-            if not self.categories_cache:
-                self.categories_cache = []
-            self.categories_cache.append(new_category)
-            
-            return new_category
-            
-        except Exception as e:
-            logger.error(f"Failed to create category: {e}")
-            return None
-    
-    def _create_slug(self, text: str) -> str:
-        """Creează un slug din text"""
-        # Înlocuiește caracterele românești
-        replacements = {
-            'ă': 'a', 'â': 'a', 'î': 'i', 'ș': 's', 'ț': 't',
-            'Ă': 'a', 'Â': 'a', 'Î': 'i', 'Ș': 's', 'Ț': 't'
-        }
-        
-        for rom, eng in replacements.items():
-            text = text.replace(rom, eng)
-        
-        # Convertește la lowercase și înlocuiește spațiile cu dash
-        slug = text.lower()
-        slug = re.sub(r'[^a-z0-9]+', '-', slug)
-        slug = slug.strip('-')
-        
-        return slug
-    
-    def import_product(self, product_data: Dict) -> Dict:
-        """Importă un produs în Gomag"""
-        try:
-            # Pregătește datele pentru import
-            gomag_product = {
-                "name": product_data.get('name', ''),
-                "sku": product_data.get('sku', ''),
-                "price": product_data.get('price', 0),
-                "special_price": product_data.get('special_price'),
-                "description": product_data.get('description', ''),
-                "short_description": product_data.get('short_description', ''),
-                "category_id": product_data.get('category_id'),
-                "brand": product_data.get('brand', ''),
-                "weight": product_data.get('weight', 1),
-                "status": 1,
-                "stock": product_data.get('stock', 100),
-                "images": product_data.get('images', []),
-                "meta_title": product_data.get('meta_title', ''),
-                "meta_description": product_data.get('meta_description', ''),
-                "meta_keywords": product_data.get('meta_keywords', '')
-            }
-            
-            # Încearcă import prin API
-            endpoints = [
-                f"{self.base_url}/api/products",
-                f"{self.base_url}/admin/products/import"
-            ]
-            
-            for endpoint in endpoints:
-                try:
-                    response = self.session.post(
-                        endpoint,
-                        json=gomag_product,
-                        timeout=30
-                    )
+                        # Import
+                        result = st.session_state.gomag_api.import_product(import_data)
+                        results.append(result)
+                        
+                        if result['success']:
+                            product['import_status'] = 'success'
+                            product['gomag_id'] = result.get('product_id')
+                        else:
+                            product['import_status'] = 'failed'
+                            product['import_error'] = result.get('message')
                     
-                    if response.status_code in [200, 201]:
-                        return {
-                            "success": True,
-                            "product_id": response.json().get('id'),
-                            "message": "Produs importat cu succes"
-                        }
-                except:
-                    continue
+                    # Afișare rezultate
+                    success_count = len([r for r in results if r['success']])
+                    st.success(f"✅ {success_count}/{len(results)} produse importate cu succes")
+                    
+                    # Export rezultate
+                    df_results = pd.DataFrame(results)
+                    csv = df_results.to_csv(index=False)
+                    st.download_button(
+                        "📥 Descarcă Raport Import",
+                        data=csv,
+                        file_name=f"import_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
+    
+    # Tab 5: Rapoarte
+    with tabs[4]:
+        st.header("📊 Rapoarte și Export")
+        
+        if st.session_state.products:
+            # Statistici
+            col1, col2, col3, col4 = st.columns(4)
             
-            # Dacă nu merge prin API, salvează local
-            return {
-                "success": False,
-                "product_id": None,
-                "message": "Salvat local pentru import manual",
-                "local_data": gomag_product
-            }
+            with col1:
+                st.metric("Total Produse", len(st.session_state.products))
+            with col2:
+                processed = len([p for p in st.session_state.products if p.get('status') == 'processed'])
+                st.metric("Procesate", processed)
+            with col3:
+                imported = len([p for p in st.session_state.products if p.get('import_status') == 'success'])
+                st.metric("Importate", imported)
+            with col4:
+                errors = len([p for p in st.session_state.products if p.get('status') == 'error'])
+                st.metric("Erori", errors)
             
-        except Exception as e:
-            logger.error(f"Failed to import product: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            st.divider()
+            
+            # Export
+            st.subheader("📥 Export Date")
+            
+            export_format = st.radio(
+                "Format export",
+                ["CSV", "Excel", "JSON", "Gomag CSV"]
+            )
+            
+            if st.button("📥 Generează Export"):
+                if export_format == "CSV":
+                    df = pd.DataFrame(st.session_state.products)
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        "Descarcă CSV",
+                        data=csv,
+                        file_name=f"products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
+                
+                elif export_format == "Excel":
+                    output = BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        df = pd.DataFrame(st.session_state.products)
+                        df.to_excel(writer, sheet_name='Products', index=False)
+                    
+                    st.download_button(
+                        "Descarcă Excel",
+                        data=output.getvalue(),
+                        file_name=f"products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                
+                elif export_format == "JSON":
+                    json_str = json.dumps(st.session_state.products, indent=2, ensure_ascii=False)
+                    st.download_button(
+                        "Descarcă JSON",
+                        data=json_str,
+                        file_name=f"products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        mime="application/json"
+                    )
+                
+                elif export_format == "Gomag CSV":
+                    # Format special pentru Gomag
+                    gomag_data = []
+                    for p in st.session_state.products:
+                        if p.get('status') == 'processed':
+                            gomag_data.append({
+                                'Nume': p.get('name'),
+                                'SKU': p.get('sku'),
+                                'Preț': p.get('price_ron', p.get('price', 0)),
+                                'Descriere': p.get('description'),
+                                'Categorie': next((c['name'] for c in st.session_state.categories if str(c['id']) == str(p.get('category_id'))), ''),
+                                'Brand': p.get('brand'),
+                                'Stoc': stock_default,
+                                'Imagini': '|'.join(p.get('images', [])[:5])
+                            })
+                    
+                    df_gomag = pd.DataFrame(gomag_data)
+                    csv_gomag = df_gomag.to_csv(index=False, sep=';')
+                    st.download_button(
+                        "Descarcă Gomag CSV",
+                        data=csv_gomag,
+                        file_name=f"gomag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
+
+if __name__ == "__main__":
+    main()
