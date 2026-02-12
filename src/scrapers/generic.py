@@ -75,14 +75,28 @@ class GenericScraper(Scraper):
     def parse(self, url: str) -> ProductDraft:
         domain = domain_of(url)
         html, method = fetch_html(url)
-        # if suspiciously small, try JS render
-        if len(html) < 1500:
-            try:
-                html = render_html_sync(url)
-                method = "playwright"
-            except Exception:
-                pass
-        soup = BeautifulSoup(html, "lxml")
+
+blocked_markers = [
+    "enable javascript",
+    "attention required",
+    "access denied",
+    "captcha",
+    "cloudflare",
+    "cookie",
+    "cookies",
+    "consent",
+    "please enable",
+]
+
+# Forteaza Playwright daca pare blocat (mesaje de JS/captcha/consent) sau daca HTML e prea mic
+if len(html) < 1500 or any(mark in html.lower() for mark in blocked_markers):
+    try:
+        html = render_html_sync(url, wait_ms=2500)
+        method = "playwright"
+    except Exception:
+        pass
+
+soup = BeautifulSoup(html, "lxml")
 
         title = _extract_title(soup)
         price = _extract_price(soup)
