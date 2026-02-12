@@ -26,7 +26,6 @@ def _extract_images_basic(soup: BeautifulSoup, base_url: str) -> list[str]:
             continue
         imgs.append(src)
 
-    # dedupe keep order
     seen = set()
     out: list[str] = []
     for u in imgs:
@@ -46,7 +45,6 @@ def _extract_title_basic(soup: BeautifulSoup) -> str:
 
 
 def _extract_price_basic(soup: BeautifulSoup) -> float | None:
-    # heuristic: find first price-like pattern
     text = soup.get_text(" ", strip=True)
     m = re.search(r"(\d+[\.,]?\d*)\s*(lei|ron|eur|€)", text, re.IGNORECASE)
     if not m:
@@ -72,7 +70,6 @@ def _extract_desc_basic(soup: BeautifulSoup) -> str:
         if el and len(el.get_text(strip=True)) > 50:
             return str(el)
 
-    # fallback: largest paragraph-like block
     ps = soup.find_all(["p", "div"])
     best = ""
     for p in ps:
@@ -84,18 +81,13 @@ def _extract_desc_basic(soup: BeautifulSoup) -> str:
 
 def _iter_jsonld_objects(soup: BeautifulSoup):
     for sc in soup.select('script[type="application/ld+json"]'):
-        raw = sc.string or sc.get_text() or ""
-        raw = raw.strip()
+        raw = (sc.string or sc.get_text() or "").strip()
         if not raw:
             continue
-        # Some sites put multiple JSON objects without a list; try best-effort parsing.
         try:
             data = json.loads(raw)
         except Exception:
-            # attempt to fix trailing garbage
             continue
-
-        # normalize to list of objects
         if isinstance(data, dict):
             yield data
         elif isinstance(data, list):
@@ -105,46 +97,27 @@ def _iter_jsonld_objects(soup: BeautifulSoup):
 
 
 def _find_product_jsonld(soup: BeautifulSoup) -> dict | None:
-    # Return the first JSON-LD node describing a Product
     for obj in _iter_jsonld_objects(soup):
-        # direct Product
         t = obj.get("@type") or obj.get("type")
-        if isinstance(t, list):
-            if "Product" in t:
-                return obj
+        if isinstance(t, list) and "Product" in t:
+            return obj
         if t == "Product":
             return obj
-
-        # graph
         graph = obj.get("@graph")
         if isinstance(graph, list):
             for node in graph:
-                if not isinstance(node, dict):
-                    continue
-                nt = node.get("@type")
-                if isinstance(nt, list):
-                    if "Product" in nt:
-                        return node
-                if nt == "Product":
+                if isinstance(node, dict) and node.get("@type") == "Product":
                     return node
     return None
 
 
 def _jsonld_get_images(prod: dict) -> list[str]:
     imgs = prod.get("image")
-    out: list[str] = []
     if isinstance(imgs, str):
-        out = [imgs]
-    elif isinstance(imgs, list):
-        out = [x for x in imgs if isinstance(x, str)]
-    # dedupe
-    seen = set()
-    res = []
-    for u in out:
-        if u not in seen:
-            seen.add(u)
-            res.append(u)
-    return res
+        return [imgs]
+    if isinstance(imgs, list):
+        return [x for x in imgs if isinstance(x, str)]
+    return []
 
 
 def _jsonld_get_price(prod: dict) -> float | None:
@@ -157,7 +130,7 @@ def _jsonld_get_price(prod: dict) -> float | None:
             return float(str(p).replace(",", "."))
         except Exception:
             return None
-    if isinstance(offers, list) and offers:
+    if isinstance(offers, list):
         for o in offers:
             if isinstance(o, dict) and o.get("price") is not None:
                 try:
@@ -173,7 +146,6 @@ class GenericScraper(Scraper):
 
     def parse(self, url: str) -> ProductDraft:
         domain = domain_of(url)
-
         html, method = fetch_html(url)
 
         blocked_markers = [
@@ -189,18 +161,22 @@ class GenericScraper(Scraper):
             "for full functionality of this site",
         ]
 
-        # Force Playwright when blocked or HTML too small
+        tried_playwright = False
+        pw_error = ""
+
         if len(html) < 1500 or any(mark in html.lower() for mark in blocked_markers):
+            tried_playwright = True
             try:
                 html = render_html_sync(url, wait_ms=2500)
                 method = "playwright"
-            except Exception:
-                pass
+            except Exception as e:
+                # IMPORTANT: nu mai ascundem eroarea, o punem in notes
+                pw_error = f"playwright_failed={type(e).__name__}: {e}"
 
         soup = BeautifulSoup(html, "lxml")
 
-        # Prefer JSON-LD Product data if available (fixes many sites with complex layouts)
         prod = _find_product_jsonld(soup)
+
         title = None
         desc_html = None
         images = None
@@ -210,15 +186,12 @@ class GenericScraper(Scraper):
         if prod:
             title = clean_text(str(prod.get("name") or "")) or None
             sku = clean_text(str(prod.get("sku") or "")) or None
-
-            # description in JSON-LD is plain text; wrap in <p>
             d = prod.get("description")
             if isinstance(d, str) and clean_text(d):
                 desc_html = f"<p>{clean_text(d)}</p>"
             images = _jsonld_get_images(prod) or None
             price = _jsonld_get_price(prod)
 
-        # Fallbacks
         if not title:
             title = _extract_title_basic(soup)
         if not desc_html:
@@ -228,13 +201,18 @@ class GenericScraper(Scraper):
         if price is None:
             price = _extract_price_basic(soup)
 
-        # Fallback SKU extraction from DOM
         if not sku:
             for sel in ['[itemprop="sku"]', ".sku", ".product-sku", "#sku"]:
                 el = soup.select_one(sel)
                 if el and clean_text(el.get_text()):
                     sku = clean_text(el.get_text())
                     break
+
+        notes_parts = [f"generic=v4-jsonld", f"parsed_with={method}"]
+        if tried_playwright and method != "playwright":
+            notes_parts.append("playwright_tried=YES")
+        if pw_error:
+            notes_parts.append(pw_error)
 
         return ProductDraft(
             source_url=url,
@@ -247,5 +225,5 @@ class GenericScraper(Scraper):
             price=price,
             currency="RON",
             needs_translation=False,
-            notes=f"parsed_with={method}",
+            notes=" | ".join(notes_parts),
         )
