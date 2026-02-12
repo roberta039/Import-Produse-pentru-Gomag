@@ -24,12 +24,10 @@ from src.export_gomag import to_gomag_dataframe, save_xlsx
 from src.gomag_ui import GomagCreds, fetch_categories, import_file
 
 st.set_page_config(page_title="Gomag Importer", layout="wide")
-st.title("Import produse in Gomag (fara API keys)")
+st.title("Import produse in Gomag")
 st.caption("Flux: Excel -> preluare date -> tabel intermediar -> genereaza XLSX import -> (optional) browser automation import in Gomag")
 
 with st.sidebar:
-    st.header("Setari pret / stoc")
-    st.write("Reguli: pret x2, pret minim 1 leu, stoc 1, active = DA")
     st.divider()
     st.header("Gomag")
     gomag_enabled = st.checkbox("Activeaza conectare Gomag (Playwright)", value=False)
