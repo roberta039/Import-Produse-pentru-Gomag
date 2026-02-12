@@ -1,17 +1,20 @@
 from __future__ import annotations
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse, urljoin
+
 import re
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup
 
 from .base import Scraper
-from ..models import ProductDraft
-from ..fetch import fetch_html
 from ..browser import render_html_sync
-from ..utils import domain_of, ensure_sku, clean_text
+from ..fetch import fetch_html
+from ..models import ProductDraft
+from ..utils import clean_text, domain_of, ensure_sku
+
 
 def _extract_images(soup: BeautifulSoup, base_url: str) -> list[str]:
-    imgs = []
-    for img in soup.select('img'):
+    imgs: list[str] = []
+    for img in soup.select("img"):
         src = img.get("src") or img.get("data-src") or img.get("data-original")
         if not src:
             continue
@@ -21,13 +24,16 @@ def _extract_images(soup: BeautifulSoup, base_url: str) -> list[str]:
         if any(x in src.lower() for x in ["logo", "icon", "sprite"]):
             continue
         imgs.append(src)
-    # dedupe while keeping order
+
+    # dedupe keep order
     seen = set()
-    out = []
+    out: list[str] = []
     for u in imgs:
         if u not in seen:
-            seen.add(u); out.append(u)
+            seen.add(u)
+            out.append(u)
     return out[:12]
+
 
 def _extract_title(soup: BeautifulSoup) -> str:
     h1 = soup.select_one("h1")
@@ -37,8 +43,9 @@ def _extract_title(soup: BeautifulSoup) -> str:
         return clean_text(soup.title.get_text())
     return "Produs"
 
+
 def _extract_price(soup: BeautifulSoup) -> float | None:
-    # heuristic: look for currency patterns
+    # heuristic: find first price-like pattern
     text = soup.get_text(" ", strip=True)
     m = re.search(r"(\d+[\.,]?\d*)\s*(lei|ron|eur|€)", text, re.IGNORECASE)
     if not m:
@@ -49,17 +56,22 @@ def _extract_price(soup: BeautifulSoup) -> float | None:
     except Exception:
         return None
 
+
 def _extract_desc(soup: BeautifulSoup) -> str:
-    # prefer common product description containers
     for sel in [
         '[itemprop="description"]',
-        '.product-description', '.description', '#description',
-        '.tab-content', '.product-tabs', '.product__description'
+        ".product-description",
+        ".description",
+        "#description",
+        ".tab-content",
+        ".product-tabs",
+        ".product__description",
     ]:
         el = soup.select_one(sel)
         if el and len(el.get_text(strip=True)) > 50:
             return str(el)
-    # fallback: first substantial paragraph block
+
+    # fallback: largest paragraph-like block
     ps = soup.find_all(["p", "div"])
     best = ""
     for p in ps:
@@ -68,35 +80,38 @@ def _extract_desc(soup: BeautifulSoup) -> str:
             best = t
     return f"<p>{best}</p>" if best else ""
 
+
 class GenericScraper(Scraper):
     def can_handle(self, url: str) -> bool:
         return True
 
     def parse(self, url: str) -> ProductDraft:
         domain = domain_of(url)
+
         html, method = fetch_html(url)
 
-blocked_markers = [
-    "enable javascript",
-    "attention required",
-    "access denied",
-    "captcha",
-    "cloudflare",
-    "cookie",
-    "cookies",
-    "consent",
-    "please enable",
-]
+        blocked_markers = [
+            "enable javascript",
+            "attention required",
+            "access denied",
+            "captcha",
+            "cloudflare",
+            "cookie",
+            "cookies",
+            "consent",
+            "please enable",
+            "for full functionality of this site",
+        ]
 
-# Forteaza Playwright daca pare blocat (mesaje de JS/captcha/consent) sau daca HTML e prea mic
-if len(html) < 1500 or any(mark in html.lower() for mark in blocked_markers):
-    try:
-        html = render_html_sync(url, wait_ms=2500)
-        method = "playwright"
-    except Exception:
-        pass
+        # Force Playwright when blocked or HTML too small
+        if len(html) < 1500 or any(mark in html.lower() for mark in blocked_markers):
+            try:
+                html = render_html_sync(url, wait_ms=2500)
+                method = "playwright"
+            except Exception:
+                pass
 
-soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "lxml")
 
         title = _extract_title(soup)
         price = _extract_price(soup)
@@ -104,14 +119,13 @@ soup = BeautifulSoup(html, "lxml")
         images = _extract_images(soup, url)
 
         sku = None
-        # try common sku markers
-        for sel in ['[itemprop="sku"]', '.sku', '.product-sku', '#sku']:
+        for sel in ['[itemprop="sku"]', ".sku", ".product-sku", "#sku"]:
             el = soup.select_one(sel)
             if el and clean_text(el.get_text()):
                 sku = clean_text(el.get_text())
                 break
 
-        draft = ProductDraft(
+        return ProductDraft(
             source_url=url,
             domain=domain,
             sku=ensure_sku(url, sku),
@@ -122,6 +136,5 @@ soup = BeautifulSoup(html, "lxml")
             price=price,
             currency="RON",
             needs_translation=False,
-            notes=f"parsed_with={method}"
+            notes=f"parsed_with={method}",
         )
-        return draft
