@@ -1,3 +1,39 @@
+
+# =====================
+# Debug artifacts panel (top)
+# =====================
+with st.sidebar.expander("Debug (download artifacts)", expanded=False):
+    dbg_dir = "debug_artifacts"
+    if os.path.isdir(dbg_dir):
+        files = sorted([f for f in os.listdir(dbg_dir) if os.path.isfile(os.path.join(dbg_dir, f))])
+        if not files:
+            st.info("Nu exista fisiere in debug_artifacts/.")
+        else:
+            st.write(f"Gasite {len(files)} fisiere in {dbg_dir}/")
+            for fn in files:
+                path = os.path.join(dbg_dir, fn)
+                try:
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                    mime = "application/octet-stream"
+                    if fn.lower().endswith(".html"):
+                        mime = "text/html"
+                    elif fn.lower().endswith(".png"):
+                        mime = "image/png"
+                    elif fn.lower().endswith(".txt"):
+                        mime = "text/plain"
+                    st.download_button(
+                        label=f"Download {fn}",
+                        data=data,
+                        file_name=fn,
+                        mime=mime,
+                        key=f"dl_{fn}",
+                    )
+                except Exception as e:
+                    st.error(f"Nu pot citi {fn}: {e}")
+    else:
+        st.info("Folderul debug_artifacts/ nu exista (inca). Ruleaza o data importul ca sa se genereze fisiere.")
+
 from __future__ import annotations
 import streamlit as st
 # --- PSI ProductFinder creds -> env (for scrapers) ---
