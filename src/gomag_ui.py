@@ -89,7 +89,8 @@ def _dashboard_url(base: str) -> str:
 
 
 def _categories_url(base: str) -> str:
-    return base.rstrip("/") + "/gomag/dashboard/categories"
+    # User confirmed this is the correct categories list URL in Gomag
+    return base.rstrip("/") + "/gomag/product/category/list"
 
 
 async def _login(page, creds: GomagCreds):
@@ -127,6 +128,7 @@ def _parse_categories_from_html(html: str) -> List[str]:
         name = tds[0].get_text(" ", strip=True).replace("\u00a0", " ").strip()
         if not name:
             continue
+        # remove any inline ID text if present in the same cell
         name = name.split("ID:")[0].strip()
         if name and name not in cats:
             cats.append(name)
@@ -142,12 +144,13 @@ async def fetch_categories_async(creds: GomagCreds) -> List[str]:
             await _login(page, creds)
             await _goto_with_fallback(page, _categories_url(creds.base_url))
 
+            # wait for table rows to appear
             try:
                 await page.wait_for_selector("table tbody tr", timeout=20000)
             except Exception:
                 await page.wait_for_timeout(3000)
 
-            await page.wait_for_timeout(800)
+            await page.wait_for_timeout(600)
             html = await page.content()
             return _parse_categories_from_html(html)
         finally:
