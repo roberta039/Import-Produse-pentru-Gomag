@@ -12,14 +12,6 @@ import yaml
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
-# --- URL normalization (force https for Gomag where possible) ---
-def _normalize_base_url(base_url: str) -> str:
-    base = (base_url or '').strip()
-    if base.startswith('http://'):
-        # Gomag admin usually works best over HTTPS; we ignore TLS errors in Playwright anyway.
-        return 'https://' + base[len('http://'):].lstrip('/')
-    return base
-
 
 # ============================================================
 # Playwright runtime install + SSL/TLS workaround (Streamlit Cloud)
@@ -81,54 +73,21 @@ async def _launch_ctx(p):
 
 
 async def _goto_with_fallback(page, url: str):
-    """Robust navigation for Streamlit Cloud + Gomag:
-    - forces https first (even if url is http)
-    - ignores TLS errors (handled in context)
-    - captures response status for debugging
-    - retries once if HTML shell is empty
     """
-    url = (url or "").strip()
-    if url.startswith("http://"):
-        primary = "https://" + url[len("http://"):]
-    else:
-        primary = url
-    fallback = None
-    if primary.startswith("https://"):
-        fallback = "http://" + primary[len("https://"):]
-
-    last_err = None
-    for attempt, target in enumerate([primary, fallback] if fallback else [primary], start=1):
-        if not target:
-            continue
-        try:
-            resp = await page.goto(target, wait_until="domcontentloaded", timeout=120000)
-            # wait for SPA shell / scripts
-            try:
-                await page.wait_for_load_state("networkidle", timeout=45000)
-            except Exception:
-                pass
-
-            # If response exists, check status
-            if resp is not None:
-                status = resp.status
-                if status >= 400:
-                    raise RuntimeError(f"HTTP {status} at {target}")
-            # Sometimes we get an empty shell; retry once after a short delay
-            html = await page.content()
-            if html.strip() in ("<html><head></head><body></body></html>", "<html><head></head><body></body></html>\n"):
-                if attempt == 1:
-                    await page.wait_for_timeout(2000)
-                    await page.reload(wait_until="domcontentloaded", timeout=120000)
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=45000)
-                    except Exception:
-                        pass
+    Fix pentru ERR_SSL_PROTOCOL_ERROR:
+    - încearcă https
+    - dacă pică handshake-ul, încearcă http
+    """
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        return
+    except Exception:
+        if url.startswith("https://"):
+            await page.goto("http://" + url[len("https://"):], wait_until="domcontentloaded", timeout=60000)
             return
-        except Exception as e:
-            last_err = e
-            continue
+        raise
 
-    raise RuntimeError(f"Navigation failed. primary={primary} fallback={fallback} last={last_err}")
+
 async def _wait_render(page, extra_ms: int = 800):
     # Pentru pagini cu XHR: networkidle e mai robust
     try:
@@ -205,7 +164,7 @@ def _load_cfg():
 
 
 async def _login(page, creds: GomagCreds, cfg):
-    login_url = _normalize_base_url(creds.base_url).rstrip("/") + (creds.dashboard_path or "/gomag/dashboard")
+    login_url = creds.base_url.rstrip("/") + (creds.dashboard_path or "/gomag/dashboard")
     await _goto_with_fallback(page, login_url)
     await _wait_render(page, 600)
 
@@ -224,7 +183,7 @@ async def fetch_categories_async(creds: GomagCreds) -> List[str]:
     # IMPORTANT: user a confirmat URL-ul corect:
     # /gomag/product/category/list
     url_path = cfg.get("gomag", {}).get("categories", {}).get("url_path") or "/gomag/product/category/list"
-    url = _normalize_base_url(creds.base_url).rstrip("/") + url_path
+    url = creds.base_url.rstrip("/") + url_path
 
     async with async_playwright() as p:
         browser, context, page = await _launch_ctx(p)
@@ -291,34 +250,82 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
     cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
 
-    url = _normalize_base_url(creds.base_url).rstrip("/") + cfg["gomag"]["import"]["url_path"]
+    base = _normalize_base_url(creds.base_url).rstrip("/")
+
+    # Candidate import paths (Gomag endpoints differ by account/version)
+    cfg_path = cfg.get("gomag", {}).get("import", {}).get("url_path") or ""
+    candidates = [p for p in [
+        cfg_path,
+        "/gomag/product/import",
+        "/gomag/product/import/list",
+        "/gomag/product/imports",
+        "/gomag/dashboard/products/import",
+        "/gomag/products/import",
+        "/gomag/product/importer",
+    ] if p]
 
     async with async_playwright() as p:
         browser, context, page = await _launch_ctx(p)
         try:
             await _login(page, creds, cfg)
 
-            await _goto_with_fallback(page, url)
-            await _wait_render(page, 1000)
+            last_nav_err = None
+            chosen = None
+            for path in candidates:
+                url = base + (path if path.startswith("/") else "/" + path)
+                try:
+                    await _goto_with_fallback(page, url)
+                    await _wait_render(page, 1200)
+                    html = await page.content()
+                    # accept if DOM is not empty shell
+                    if html and "<body></body>" not in html.replace(" ", ""):
+                        chosen = url
+                        break
+                except Exception as e:
+                    last_nav_err = e
+                    continue
 
-            # upload
-            await page.set_input_files(cfg["gomag"]["import"]["file_input_selector"], file_path)
+            if not chosen:
+                raise RuntimeError(f"Nu am gasit pagina de import valida. Ultima eroare: {last_nav_err}")
 
-            # attempt start
+            # 1) try config file input selector
+            note = ""
+            file_sel = cfg.get("gomag", {}).get("import", {}).get("file_input_selector")
+            if file_sel:
+                try:
+                    loc = page.locator(file_sel).first
+                    await loc.wait_for(state="attached", timeout=15000)
+                    await loc.set_input_files(file_path, timeout=30000)
+                    note = f"cfg:{file_sel}"
+                except Exception:
+                    note = ""
+
+            # 2) try generic input search
+            if not note:
+                try:
+                    note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)
+                except Exception:
+                    note = ""
+
+            # 3) file chooser sweep fallback
+            if not note:
+                note = await _upload_via_filechooser_sweep(page, file_path)
+
+            await _wait_render(page, 1200)
+
+            # Start import (if exists)
             try:
-                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=5000)
+                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=7000)
+                await page.wait_for_timeout(1500)
+                return f"Fisier incarcat ({note}). Import pornit (daca Gomag nu a cerut pasi suplimentari). Pagina: {chosen}"
             except Exception:
                 return (
-                    "Am incarcat fisierul, dar nu am putut porni importul automat "
-                    "(probabil e nevoie de mapare coloane manual la prima rulare)."
+                    f"Fisier incarcat ({note}). Nu am putut porni importul automat "
+                    f"(probabil e nevoie de mapare coloane/manual la prima rulare). Pagina: {chosen}"
                 )
-
-            await page.wait_for_timeout(2000)
-            return "Import pornit (daca Gomag nu a cerut pasi suplimentari)."
         finally:
             await context.close()
             await browser.close()
-
 
 def import_file(creds: GomagCreds, file_path: str) -> str:
     return asyncio.run(import_file_async(creds, file_path))
