@@ -1,3 +1,6 @@
+import streamlit as st
+import os
+
 
 # =====================
 # Debug artifacts panel (top)
@@ -33,6 +36,8 @@ with st.sidebar.expander("Debug (download artifacts)", expanded=False):
                     st.error(f"Nu pot citi {fn}: {e}")
     else:
         st.info("Folderul debug_artifacts/ nu exista (inca). Ruleaza o data importul ca sa se genereze fisiere.")
+
+from __future__ import annotations
 import streamlit as st
 # --- PSI ProductFinder creds -> env (for scrapers) ---
 import os as _os
