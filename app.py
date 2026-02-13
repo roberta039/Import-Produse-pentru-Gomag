@@ -1,38 +1,28 @@
-import streamlit as st
 import os
-# =====================
-# Debug artifacts panel (top)
-# =====================
-
-
-import streamlit as st
-# --- PSI ProductFinder creds -> env (for scrapers) ---
-import os as _os
-try:
-    _os.environ["PSI_USER"] = str(st.secrets.get("SOURCES", {}).get("PSI_USER", "")).strip()
-    _os.environ["PSI_PASS"] = str(st.secrets.get("SOURCES", {}).get("PSI_PASS", "")).strip()
-except Exception:
-    pass
-
-# --- XDConnects creds -> env (for scrapers) ---
-import os as _os
-try:
-    _os.environ["XD_USER"] = str(st.secrets.get("SOURCES", {}).get("XD_USER", "")).strip()
-    _os.environ["XD_PASS"] = str(st.secrets.get("SOURCES", {}).get("XD_PASS", "")).strip()
-except Exception:
-    pass
+import tempfile
 
 import pandas as pd
-import tempfile
-from src.utils import detect_url_column
-from src.pipeline import scrape_products
-from src.export_gomag import to_gomag_dataframe, save_xlsx
+import streamlit as st
+
+from src.export_gomag import save_xlsx, to_gomag_dataframe
 from src.gomag_ui import GomagCreds, fetch_categories, import_file
+from src.pipeline import scrape_products
+from src.utils import detect_url_column
+
+# --- Load source-site creds into env (used by scrapers) ---
+try:
+    os.environ["PSI_USER"] = str(st.secrets.get("SOURCES", {}).get("PSI_USER", "")).strip()
+    os.environ["PSI_PASS"] = str(st.secrets.get("SOURCES", {}).get("PSI_PASS", "")).strip()
+    os.environ["XD_USER"] = str(st.secrets.get("SOURCES", {}).get("XD_USER", "")).strip()
+    os.environ["XD_PASS"] = str(st.secrets.get("SOURCES", {}).get("XD_PASS", "")).strip()
+except Exception:
+    pass
 
 st.set_page_config(page_title="Gomag Importer", layout="wide")
 
-
-# Debug (download artifacts)
+# =====================
+# Debug artifacts panel (sidebar)
+# =====================
 with st.sidebar.expander("Debug (download artifacts)", expanded=False):
     dbg_dir = "debug_artifacts"
     if os.path.isdir(dbg_dir):
@@ -63,7 +53,7 @@ with st.sidebar.expander("Debug (download artifacts)", expanded=False):
                 except Exception as e:
                     st.error(f"Nu pot citi {fn}: {e}")
     else:
-        st.info("Folderul debug_artifacts/ nu exista (inca). Ruleaza o data importul ca sa se genereze fisiere.")
+        st.info("Folderul debug_artifacts/ nu exista (inca). Dupa o rulare, vor aparea aici fisierele.")
 
 st.title("Import produse in Gomag")
 st.caption("Flux: Excel -> preluare date -> tabel intermediar -> genereaza XLSX import -> (optional) browser automation import in Gomag")
@@ -102,11 +92,12 @@ if uploaded:
     if not url_col:
         st.error("Nu am gasit coloana URL. Foloseste una din: url / link / product_url")
         st.stop()
+
     urls = df[url_col].dropna().astype(str).tolist()
     st.write(f"Gasite **{len(urls)}** link-uri in coloana **{url_col}**.")
     st.dataframe(df.head(20), use_container_width=True)
 
-    colA, colB = st.columns([1,1])
+    colA, colB = st.columns([1, 1])
     with colA:
         if st.button("2) Preia date din link-uri", type="primary"):
             with st.spinner("Scrape in curs (poate dura)..."):
@@ -123,83 +114,28 @@ if uploaded:
                 except Exception as e:
                     st.error(f"Eroare la citire categorii: {e}")
 
-if st.session_state["drafts"]:
+drafts = st.session_state.get("drafts", [])
+if drafts:
     st.subheader("3) Tabel intermediar (verifica / corecteaza)")
-    drafts = st.session_state["drafts"]
-    cats = st.session_state.get("categories", [])
-
-    # Build editable df
-    base_rows = []
-    for p in drafts:
-        base_rows.append({
-            "source_url": p.source_url,
-            "sku": p.sku,
-            "title_ro": p.title,
-            "short_ro": p.short_description,
-            "desc_html_ro": p.description_html,
-            "price_source": p.price if p.price is not None else "",
-            "price_final": p.price_final(),
-            "images": "|".join(p.images or []),
-            "category": "",
-            "needs_translation": p.needs_translation,
-            "notes": p.notes,
-        })
-    df_edit = pd.DataFrame(base_rows)
-
-    # category dropdown
-    colcfg = {}
-    if cats:
-        colcfg["category"] = st.column_config.SelectboxColumn(
-            "category", options=[""] + cats, help="Alege categoria Gomag"
-        )
-    else:
-        colcfg["category"] = st.column_config.TextColumn("category", help="Scrie categoria (ex: Rucsacuri>Antifurt)")
-
-    edited = st.data_editor(
-        df_edit,
-        use_container_width=True,
-        num_rows="fixed",
-        column_config=colcfg,
-        hide_index=True
-    )
-    st.session_state["df_edit"] = edited
+    df_products = pd.DataFrame(drafts)
+    st.session_state["df_edit"] = st.data_editor(df_products, use_container_width=True, num_rows="dynamic")
 
     st.subheader("4) Genereaza fisier import Gomag")
-    col1, col2, col3 = st.columns([1,1,1])
-    with col1:
-        if st.button("Genereaza XLSX"):
-            # push category back into drafts via map
-            category_map = {row["source_url"]: row.get("category","") for _, row in edited.iterrows()}
-            df_gomag = to_gomag_dataframe(drafts, category_map=category_map)
+    df_final = st.session_state["df_edit"] if st.session_state.get("df_edit") is not None else df_products
+    gomag_df = to_gomag_dataframe(df_final, categories=st.session_state.get("categories", []))
 
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-            tmp.close()
-            save_xlsx(df_gomag, tmp.name)
+    st.dataframe(gomag_df.head(50), use_container_width=True)
 
-            with open(tmp.name, "rb") as f:
-                st.download_button(
-                    "Descarca import_gomag.xlsx",
-                    data=f,
-                    file_name="import_gomag.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary"
-                )
-            st.dataframe(df_gomag.head(50), use_container_width=True)
+    tmpdir = tempfile.mkdtemp()
+    out_xlsx = os.path.join(tmpdir, "gomag_import.xlsx")
+    save_xlsx(gomag_df, out_xlsx)
 
-            st.session_state["last_export_path"] = tmp.name
+    with open(out_xlsx, "rb") as f:
+        st.download_button("Descarca XLSX pentru Gomag", f, file_name="gomag_import.xlsx")
 
-    with col2:
-        if creds and st.button("5) Import in Gomag (Playwright)"):
-            export_path = st.session_state.get("last_export_path")
-            if not export_path:
-                st.error("Genereaza mai intai XLSX (butonul de mai sus).")
-            else:
-                with st.spinner("Import in Gomag..."):
-                    try:
-                        msg = import_file(creds, export_path)
-                        st.success(msg)
-                    except Exception as e:
-                        st.error(f"Eroare import: {e}")
-
-    with col3:
-        st.info("Tip: Fa o importare manuala o data in Gomag ca sa salvezi maparea coloanelor; apoi automatizarea devine mai stabila.")
+    if creds:
+        st.subheader("5) Import in Gomag (browser automation)")
+        if st.button("Import in Gomag acum", type="primary"):
+            with st.spinner("Incarc fisierul si pornesc importul in Gomag..."):
+                msg = import_file(creds, out_xlsx)
+            st.success(msg)
