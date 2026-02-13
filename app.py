@@ -1,7 +1,5 @@
 from __future__ import annotations
 import streamlit as st
-import time
-from concurrent.futures import ThreadPoolExecutor
 # --- PSI ProductFinder creds -> env (for scrapers) ---
 import os as _os
 try:
@@ -128,21 +126,21 @@ if st.session_state["drafts"]:
     st.subheader("4) Genereaza fisier import Gomag")
     col1, col2, col3 = st.columns([1,1,1])
     with col1:
-        if st.button("Genereaza XLSX"):
+        if st.button("Genereaza TSV"):
             # push category back into drafts via map
             category_map = {row["source_url"]: row.get("category","") for _, row in edited.iterrows()}
             df_gomag = to_gomag_dataframe(drafts, category_map=category_map)
 
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
             tmp.close()
-            save_xlsx(df_gomag, tmp.name)
+            save_tsv(df_gomag, tmp.name)
 
             with open(tmp.name, "rb") as f:
                 st.download_button(
-                    "Descarca import_gomag.xlsx",
+                    "Descarca import_gomag.tsv",
                     data=f,
-                    file_name="import_gomag.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    file_name="import_gomag.tsv",
+                    mime="text/tab-separated-values",
                     type="primary"
                 )
             st.dataframe(df_gomag.head(50), use_container_width=True)
@@ -155,65 +153,12 @@ if st.session_state["drafts"]:
             if not export_path:
                 st.error("Genereaza mai intai XLSX (butonul de mai sus).")
             else:
-                # Ruleaza importul in thread + progres, ca sa nu para blocat
-
-                with st.status("Import in Gomag...", expanded=True) as status:
-
-                    status.write("Pornesc automatizarea (Playwright)...")
-
-                    executor = ThreadPoolExecutor(max_workers=1)
-
-                    fut = executor.submit(import_file, creds, export_path)
-
-                    t0 = time.time()
-
-                    timeout_s = 300  # 5 minute
-
-                    last_tick = -1
-
-
-                    while not fut.done():
-
-                        elapsed = int(time.time() - t0)
-
-                        if elapsed != last_tick and elapsed % 3 == 0:
-
-                            status.write(f"Inca ruleaza... {elapsed}s")
-
-                            last_tick = elapsed
-
-                        if elapsed >= timeout_s:
-
-                            status.update(label="Timeout import", state="error", expanded=True)
-
-                            st.error(
-
-                                "Importul dureaza prea mult. Cel mai probabil Gomag ruleaza importul in fundal "
-
-                                "sau pagina s-a blocat. Verifica in Gomag: Produse > Import (lista importuri)."
-
-                            )
-
-                            break
-
-                        time.sleep(1)
-
-
-                    if fut.done():
-
-                        try:
-
-                            msg = fut.result()
-
-                            status.update(label="Import finalizat", state="complete", expanded=False)
-
-                            st.success(msg)
-
-                        except Exception as e:
-
-                            status.update(label="Eroare import", state="error", expanded=True)
-
-                            st.error(f"Eroare import: {e}")
+                with st.spinner("Import in Gomag..."):
+                    try:
+                        msg = import_file(creds, export_path)
+                        st.success(msg)
+                    except Exception as e:
+                        st.error(f"Eroare import: {e}")
 
     with col3:
         st.info("Tip: Fa o importare manuala o data in Gomag ca sa salvezi maparea coloanelor; apoi automatizarea devine mai stabila.")
