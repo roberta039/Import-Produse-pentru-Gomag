@@ -7,6 +7,7 @@ import sys
 from dataclasses import dataclass
 from typing import List
 
+import yaml
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
@@ -75,46 +76,29 @@ async def _goto_with_fallback(page, url: str):
             raise
 
 
-# ========= Gomag helpers =========
+# ========= Original public API (compat with app.py) =========
 
 @dataclass
 class GomagCreds:
     base_url: str
+    dashboard_path: str
     username: str
     password: str
 
 
-def _dashboard_url(base: str) -> str:
-    return base.rstrip("/") + "/gomag/dashboard"
+def _load_cfg():
+    with open("config.yaml", "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
-def _categories_url(base: str) -> str:
-    # User confirmed this is the correct categories list URL in Gomag
-    return base.rstrip("/") + "/gomag/product/category/list"
+async def _login(page, creds: GomagCreds, cfg):
+    login_url = creds.base_url.rstrip("/") + creds.dashboard_path
+    await _goto_with_fallback(page, login_url)
 
-
-async def _login(page, creds: GomagCreds):
-    await _goto_with_fallback(page, _dashboard_url(creds.base_url))
-    await page.wait_for_timeout(800)
-
-    await page.fill(
-        'input[type="email"], input[name*="email" i], input[id*="email" i], input[name*="user" i], input[placeholder*="email" i], input[placeholder*="user" i]',
-        creds.username,
-    )
-    await page.fill(
-        'input[type="password"], input[name*="pass" i], input[id*="pass" i], input[placeholder*="parol" i], input[placeholder*="pass" i]',
-        creds.password,
-    )
-
-    try:
-        await page.click(
-            'button[type="submit"], input[type="submit"], button:has-text("Login"), button:has-text("Autentificare")',
-            timeout=8000,
-        )
-    except Exception:
-        await page.keyboard.press("Enter")
-
-    await page.wait_for_timeout(1500)
+    await page.fill(cfg["gomag"]["login"]["username_selector"], creds.username)
+    await page.fill(cfg["gomag"]["login"]["password_selector"], creds.password)
+    await page.click(cfg["gomag"]["login"]["submit_selector"])
+    await page.wait_for_timeout(int(cfg["gomag"]["login"].get("post_login_wait", 2.5) * 1000))
 
 
 def _parse_categories_from_html(html: str) -> List[str]:
@@ -128,7 +112,6 @@ def _parse_categories_from_html(html: str) -> List[str]:
         name = tds[0].get_text(" ", strip=True).replace("\u00a0", " ").strip()
         if not name:
             continue
-        # remove any inline ID text if present in the same cell
         name = name.split("ID:")[0].strip()
         if name and name not in cats:
             cats.append(name)
@@ -136,23 +119,27 @@ def _parse_categories_from_html(html: str) -> List[str]:
 
 
 async def fetch_categories_async(creds: GomagCreds) -> List[str]:
+    cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
 
     async with async_playwright() as p:
         browser, context, page = await _launch_ctx(p)
         try:
-            await _login(page, creds)
-            await _goto_with_fallback(page, _categories_url(creds.base_url))
+            await _login(page, creds, cfg)
 
-            # wait for table rows to appear
+            # URL corect confirmat de user:
+            url = creds.base_url.rstrip("/") + "/gomag/product/category/list"
+            await _goto_with_fallback(page, url)
+
+            # asteapta randurile din tabel
             try:
                 await page.wait_for_selector("table tbody tr", timeout=20000)
             except Exception:
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(2500)
 
-            await page.wait_for_timeout(600)
             html = await page.content()
-            return _parse_categories_from_html(html)
+            cats = _parse_categories_from_html(html)
+            return cats
         finally:
             await context.close()
             await browser.close()
@@ -162,6 +149,35 @@ def fetch_categories(creds: GomagCreds) -> List[str]:
     return asyncio.run(fetch_categories_async(creds))
 
 
-# IMPORTANT:
-# This patch focuses on categories loading.
-# Keep your existing import_file/import_file_async functions in your repo.
+async def import_file_async(creds: GomagCreds, file_path: str) -> str:
+    cfg = _load_cfg()
+    _ensure_playwright_chromium_installed()
+
+    async with async_playwright() as p:
+        browser, context, page = await _launch_ctx(p)
+        try:
+            await _login(page, creds, cfg)
+
+            url = creds.base_url.rstrip("/") + cfg["gomag"]["import"]["url_path"]
+            await _goto_with_fallback(page, url)
+            await page.wait_for_timeout(1000)
+
+            await page.set_input_files(cfg["gomag"]["import"]["file_input_selector"], file_path)
+
+            try:
+                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=5000)
+            except Exception:
+                return (
+                    "Am incarcat fisierul, dar nu am putut porni importul automat "
+                    "(probabil e nevoie de mapare coloane manual la prima rulare)."
+                )
+
+            await page.wait_for_timeout(2000)
+            return "Import pornit (daca Gomag nu a cerut pasi suplimentari)."
+        finally:
+            await context.close()
+            await browser.close()
+
+
+def import_file(creds: GomagCreds, file_path: str) -> str:
+    return asyncio.run(import_file_async(creds, file_path))
