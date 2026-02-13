@@ -12,6 +12,19 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
 
+@dataclass
+class GomagCreds:
+    base_url: str
+    dashboard_path: str
+    username: str
+    password: str
+
+
+def _load_cfg():
+    with open("config.yaml", "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
 # ========= Playwright runtime install + SSL/TLS workaround (Streamlit Cloud) =========
 
 def _pw_writable_browsers_path() -> str:
@@ -20,7 +33,6 @@ def _pw_writable_browsers_path() -> str:
 
 
 def _ensure_playwright_chromium_installed() -> None:
-    """Ensure Playwright Chromium exists. Safe for Streamlit Cloud."""
     if os.environ.get("PW_CHROMIUM_READY") == "1":
         return
 
@@ -76,36 +88,26 @@ async def _goto_with_fallback(page, url: str):
             raise
 
 
-# ========= Original public API (compat with app.py) =========
-
-@dataclass
-class GomagCreds:
-    base_url: str
-    dashboard_path: str
-    username: str
-    password: str
-
-
-def _load_cfg():
-    with open("config.yaml", "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
 async def _login(page, creds: GomagCreds, cfg):
     login_url = creds.base_url.rstrip("/") + creds.dashboard_path
     await _goto_with_fallback(page, login_url)
 
     await page.fill(cfg["gomag"]["login"]["username_selector"], creds.username)
     await page.fill(cfg["gomag"]["login"]["password_selector"], creds.password)
-    await page.click(cfg["gomag"]["login"]["submit_selector"])
-    await page.wait_for_timeout(int(cfg["gomag"]["login"].get("post_login_wait", 2.5) * 1000))
+
+    # submit (some forms require click, others allow Enter)
+    try:
+        await page.click(cfg["gomag"]["login"]["submit_selector"], timeout=8000)
+    except Exception:
+        await page.keyboard.press("Enter")
+
+    await page.wait_for_timeout(int(cfg["gomag"]["login"].get("post_login_wait", 2.0) * 1000))
 
 
-def _parse_categories_from_html(html: str) -> List[str]:
+def _parse_categories_from_table(html: str) -> List[str]:
     soup = BeautifulSoup(html, "lxml")
-    rows = soup.select("table tbody tr")
     cats: List[str] = []
-    for tr in rows:
+    for tr in soup.select("table tbody tr"):
         tds = tr.find_all("td")
         if not tds:
             continue
@@ -127,18 +129,41 @@ async def fetch_categories_async(creds: GomagCreds) -> List[str]:
         try:
             await _login(page, creds, cfg)
 
-            # URL corect confirmat de user:
-            url = creds.base_url.rstrip("/") + "/gomag/product/category/list"
+            url = creds.base_url.rstrip("/") + cfg["gomag"]["categories"]["url_path"]
             await _goto_with_fallback(page, url)
 
-            # asteapta randurile din tabel
+            # wait a bit for table/list to load
             try:
-                await page.wait_for_selector("table tbody tr", timeout=20000)
+                await page.wait_for_selector("table tbody tr", timeout=15000)
             except Exception:
-                await page.wait_for_timeout(2500)
+                await page.wait_for_timeout(1200)
 
-            html = await page.content()
-            cats = _parse_categories_from_html(html)
+            # 1) Try configured selectors (if any)
+            cats: List[str] = []
+            try:
+                items = await page.query_selector_all(cfg["gomag"]["categories"]["item_selector"])
+                for it in items:
+                    try:
+                        txt = (await it.inner_text()).strip()
+                        if txt and txt not in cats:
+                            cats.append(txt)
+                    except Exception:
+                        continue
+            except Exception:
+                cats = []
+
+            # 2) Robust fallback: parse table HTML (works for /gomag/product/category/list)
+            if not cats:
+                html = await page.content()
+                cats = _parse_categories_from_table(html)
+
+            # 3) If still empty, likely redirected to login or missing perms
+            if not cats:
+                html = await page.content()
+                if "Benutzername" in html or "Password" in html or "Autentificare" in html:
+                    raise RuntimeError("Nu sunt autentificat in Gomag (redirect la login) sau selectorii de login nu s-au potrivit.")
+                raise RuntimeError("Nu am putut extrage categoriile (pagina s-a incarcat, dar nu am gasit tabelul).")
+
             return cats
         finally:
             await context.close()
