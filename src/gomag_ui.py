@@ -247,8 +247,8 @@ def fetch_categories(creds: GomagCreds) -> List[str]:
 
 
 async def import_file_async(creds: GomagCreds, file_path: str) -> str:
-    """Uploads file, clicks Start Import, then reads the newest import row status.
-    If status indicates errors, opens the import details page and extracts first errors.
+    """Uploads file, clicks Start Import, then reads the newest import row status (robust HTML parsing).
+    If status indicates errors, opens import details and extracts first errors.
     """
     cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
@@ -257,23 +257,47 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
     add_url = base + cfg["gomag"]["import"]["url_path"]
     list_url = base + "/gomag/product/import/list"
 
+    def _extract_first_row(html: str):
+        soup = BeautifulSoup(html or "", "lxml")
+        row = soup.select_one("table tbody tr")
+        if not row:
+            return "", "", ""
+        tds = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+        first_text = " | ".join([t for t in tds if t])
+        status_txt = tds[-1] if tds else ""
+        # also grab first link href (details)
+        a = row.select_one("td a")
+        href = a.get("href") if a else ""
+        return first_text.strip(), status_txt.strip(), (href or "").strip()
+
+    async def _goto_and_get_html(url: str):
+        await _goto_with_fallback(page, url)
+        await _wait_render(page, 1500)
+        html = await page.content()
+        if html.strip().replace(" ", "") == "<html><head></head><body></body></html>":
+            await page.wait_for_timeout(1200)
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=120000)
+            except Exception:
+                pass
+            await _wait_render(page, 1500)
+            html = await page.content()
+        return html
+
     async with async_playwright() as p:
         browser, context, page = await _launch_ctx(p)
         try:
             await _login(page, creds, cfg)
 
-            # Snapshot first row before
-            before_first = ""
+            before_html = ""
             try:
-                await _goto_with_fallback(page, list_url)
-                await _wait_render(page, 1200)
-                before_first = (await page.locator("table tbody tr").first.inner_text(timeout=6000)).strip()
+                before_html = await _goto_and_get_html(list_url)
             except Exception:
-                before_first = ""
+                before_html = ""
+            before_first, _, _ = _extract_first_row(before_html)
 
             # Add page
-            await _goto_with_fallback(page, add_url)
-            await _wait_render(page, 1400)
+            await _goto_and_get_html(add_url)
 
             # Make file inputs visible
             try:
@@ -323,13 +347,6 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
                 except Exception:
                     attached = False
             if not attached:
-                try:
-                    os.makedirs("debug_artifacts", exist_ok=True)
-                    await page.screenshot(path="debug_artifacts/gomag_upload_not_attached.png", full_page=True)
-                    with open("debug_artifacts/gomag_upload_not_attached.html", "w", encoding="utf-8") as f:
-                        f.write(await page.content())
-                except Exception:
-                    pass
                 raise RuntimeError("Fisierul nu pare atasat (nu apare numele fisierului / input.files e gol).")
 
             # Unmap TVA fields
@@ -364,70 +381,50 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
                 raise RuntimeError("Nu gasesc butonul 'Start Import'.")
             await btn.click(timeout=10000, force=True)
 
-            # Wait a bit so Gomag registers import
             await page.wait_for_timeout(2500)
 
-            # Go to list and find newest row (first row) - must differ from before
-            await _goto_with_fallback(page, list_url)
-            await _wait_render(page, 1400)
-
-            row = page.locator("table tbody tr").first
-            try:
-                await row.wait_for(state="visible", timeout=15000)
-            except Exception:
-                pass
-
-            first_text = ""
-            try:
-                first_text = (await row.inner_text(timeout=8000)).strip()
-            except Exception:
-                first_text = ""
+            # List page after
+            after_html = await _goto_and_get_html(list_url)
+            first_text, status_txt, href = _extract_first_row(after_html)
 
             if before_first and first_text and first_text == before_first:
                 return "Start Import apasat, dar nu a aparut un import nou in lista."
 
-            # Extract status cell if possible (often last td)
-            status_txt = ""
-            try:
-                tds = row.locator("td")
-                td_count = await tds.count()
-                if td_count > 0:
-                    status_txt = (await tds.nth(td_count - 1).inner_text()).strip()
-            except Exception:
-                status_txt = ""
-
-            # If errors, open details by clicking file name link in first cell
-            if ("erori" in (status_txt or "").lower()) or ("erori" in (first_text or "").lower()):
-                try:
-                    link = row.locator("td a").first
-                    if await link.count() > 0:
-                        await link.click(timeout=10000)
-                        await _wait_render(page, 1400)
-
-                        # Find error table and return first few rows
-                        if await page.locator("text=Erori Import").count() > 0:
-                            errs = []
-                            erows = page.locator("table tbody tr")
-                            nerr = await erows.count()
-                            for i in range(min(nerr, 10)):
-                                t = await erows.nth(i).inner_text()
-                                errs.append(re.sub(r"\s+", " ", t).strip())
-                            return "Finalizat cu erori. Primele erori:\n- " + "\n- ".join(errs)
-                except Exception:
-                    pass
-
-                # Could not open details; save artifacts
+            # If empty parse, save debug for list page
+            if not first_text:
                 try:
                     os.makedirs("debug_artifacts", exist_ok=True)
-                    await page.screenshot(path="debug_artifacts/gomag_import_errors_list.png", full_page=True)
-                    with open("debug_artifacts/gomag_import_errors_list.html", "w", encoding="utf-8") as f:
-                        f.write(await page.content())
+                    await page.screenshot(path="debug_artifacts/gomag_import_list_empty.png", full_page=True)
+                    with open("debug_artifacts/gomag_import_list_empty.html", "w", encoding="utf-8") as f:
+                        f.write(after_html)
                 except Exception:
                     pass
-                return f"Finalizat cu erori, dar nu am putut extrage lista. Status='{status_txt}'. Primul rand='{first_text[:180]}'"
+                return "Import nou detectat, dar nu am putut extrage randul din lista (tabel lipsa/HTML gol). Am salvat debug_artifacts/gomag_import_list_empty.*"
 
-            return f"OK: import nou detectat. Status='{status_txt}'. Primul rand: {first_text[:180]}"
+            # If errors, open details (href may be relative)
+            if "erori" in (status_txt or "").lower() or "erori" in first_text.lower():
+                if href:
+                    if href.startswith("/"):
+                        det_url = base + href
+                    elif href.startswith("http"):
+                        det_url = href
+                    else:
+                        det_url = base + "/" + href.lstrip("/")
+                    det_html = await _goto_and_get_html(det_url)
+                    soup = BeautifulSoup(det_html or "", "lxml")
+                    if soup.select_one("h1, h2, h3") and ("Erori Import" in soup.get_text(" ", strip=True)):
+                        # extract first 10 error rows from any table
+                        errs = []
+                        for tr in soup.select("table tbody tr")[:10]:
+                            tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+                            if tds:
+                                errs.append(" | ".join(tds))
+                        if errs:
+                            return "Finalizat cu erori. Primele erori:\n- " + "\n- ".join(errs)
 
+                return f"Finalizat cu erori. Status='{status_txt}'. Primul rand: {first_text[:200]}"
+
+            return f"OK: import nou detectat. Status='{status_txt}'. Primul rand: {first_text[:200]}"
         finally:
             await context.close()
             await browser.close()
