@@ -250,97 +250,165 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
     cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
 
-    url = creds.base_url.rstrip("/") + cfg["gomag"]["import"]["url_path"]
+    base = creds.base_url.rstrip("/")
+    add_url = base + cfg["gomag"]["import"]["url_path"]
+    list_url = base + "/gomag/product/import/list"
+
+    def _extract_first_row(html: str):
+        soup = BeautifulSoup(html or "", "lxml")
+        row = soup.select_one("table tbody tr")
+        if not row:
+            return "", "", ""
+        tds = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+        first_text = " | ".join([t for t in tds if t])
+        status_txt = tds[-1] if tds else ""
+        a = row.select_one("td a")
+        href = a.get("href") if a else ""
+        return first_text.strip(), status_txt.strip(), (href or "").strip()
+
+    async def _goto_and_get_html(url: str):
+        await _goto_with_fallback(page, url)
+        await _wait_render(page, 1500)
+        html = await page.content()
+        if html.strip().replace(" ", "") == "<html><head></head><body></body></html>":
+            await page.wait_for_timeout(1200)
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=120000)
+            except Exception:
+                pass
+            await _wait_render(page, 1500)
+            html = await page.content()
+        return html
+
+    async def _upload_file_robust():
+        # Best-effort show hidden file inputs
+        try:
+            await page.evaluate("""() => {
+                document.querySelectorAll('input[type=file]').forEach(el => {
+                    el.style.display='block';
+                    el.style.visibility='visible';
+                    el.style.opacity='1';
+                    el.removeAttribute('hidden');
+                });
+            }""")
+        except Exception:
+            pass
+
+        async def _try_locator(loc):
+            try:
+                cnt = await loc.count()
+                if cnt == 0:
+                    return False
+                for i in range(cnt):
+                    try:
+                        await loc.nth(i).set_input_files(file_path, timeout=60000)
+                        return True
+                    except Exception:
+                        continue
+                return False
+            except Exception:
+                return False
+
+        # 1) main page
+        if await _try_locator(page.locator('input[type="file"]')):
+            return True
+
+        # 2) configured selector (if any)
+        sel = cfg["gomag"]["import"].get("file_input_selector")
+        if sel and sel != 'input[type="file"]':
+            if await _try_locator(page.locator(sel)):
+                return True
+
+        # 3) frames
+        for fr in page.frames:
+            if fr == page.main_frame:
+                continue
+            if await _try_locator(fr.locator('input[type="file"]')):
+                return True
+
+        return False
 
     async with async_playwright() as p:
         browser, context, page = await _launch_ctx(p)
         try:
             await _login(page, creds, cfg)
 
-            await _goto_with_fallback(page, url)
-            await _wait_render(page, 1000)
-
-            # upload# Robust upload: Gomag may hide input[type=file] or place it in iframes.
-file_input_sel = cfg["gomag"]["import"].get("file_input_selector", 'input[type="file"]')
-
-uploaded = False
-last_err = None
-
-async def _try_upload_in_locator(loc):
-    nonlocal uploaded, last_err
-    try:
-        cnt = await loc.count()
-        if cnt == 0:
-            return False
-        for i in range(cnt):
+            # Snapshot first row before
+            before_html = ""
             try:
-                await loc.nth(i).set_input_files(file_path, timeout=60000)
-                return True
-            except Exception as e:
-                last_err = e
-                continue
-        return False
-    except Exception as e:
-        last_err = e
-        return False
-
-# Make visible (best effort)
-try:
-    await page.evaluate("""() => {
-        document.querySelectorAll('input[type=file]').forEach(el => {
-            el.style.display='block';
-            el.style.visibility='visible';
-            el.style.opacity='1';
-            el.removeAttribute('hidden');
-        });
-    }""")
-except Exception:
-    pass
-
-# 1) Any input[type=file] on page
-uploaded = await _try_upload_in_locator(page.locator('input[type="file"]'))
-
-# 2) Configured selector
-if not uploaded and file_input_sel and file_input_sel != 'input[type="file"]':
-    uploaded = await _try_upload_in_locator(page.locator(file_input_sel))
-
-# 3) Any input[type=file] in frames
-if not uploaded:
-    for fr in page.frames:
-        if fr == page.main_frame:
-            continue
-        try:
-            if await _try_upload_in_locator(fr.locator('input[type="file"]')):
-                uploaded = True
-                break
-        except Exception as e:
-            last_err = e
-            continue
-
-if not uploaded:
-    try:
-        os.makedirs("debug_artifacts", exist_ok=True)
-        await page.screenshot(path="debug_artifacts/gomag_upload_no_file_input.png", full_page=True)
-        with open("debug_artifacts/gomag_upload_no_file_input.html", "w", encoding="utf-8") as f:
-            f.write(await page.content())
-    except Exception:
-        pass
-    raise RuntimeError(f"Upload esuat: nu am gasit input[type=file] utilizabil. Ultima eroare: {last_err}")
-# attempt start
-            try:
-                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=5000)
+                before_html = await _goto_and_get_html(list_url)
             except Exception:
-                return (
-                    "Am incarcat fisierul, dar nu am putut porni importul automat "
-                    "(probabil e nevoie de mapare coloane manual la prima rulare)."
-                )
+                before_html = ""
+            before_first, _, _ = _extract_first_row(before_html)
 
-            await page.wait_for_timeout(2000)
-            return "Import pornit (daca Gomag nu a cerut pasi suplimentari)."
+            # Go to import/add
+            await _goto_and_get_html(add_url)
+
+            # Upload
+            ok = await _upload_file_robust()
+            if not ok:
+                try:
+                    os.makedirs("debug_artifacts", exist_ok=True)
+                    await page.screenshot(path="debug_artifacts/gomag_upload_no_file_input.png", full_page=True)
+                    with open("debug_artifacts/gomag_upload_no_file_input.html", "w", encoding="utf-8") as f:
+                        f.write(await page.content())
+                except Exception:
+                    pass
+                raise RuntimeError("Upload esuat: nu am gasit input[type=file] utilizabil pe pagina (nici in iframe).")
+
+            await _wait_render(page, 1200)
+
+            # Click Start Import
+            btn = page.locator('button:has-text("Start Import"), a:has-text("Start Import"), [role="button"]:has-text("Start Import")').first
+            if await btn.count() == 0:
+                raise RuntimeError("Nu gasesc butonul 'Start Import'.")
+            await btn.click(timeout=15000, force=True)
+            await page.wait_for_timeout(2500)
+
+            # Read list
+            after_html = await _goto_and_get_html(list_url)
+            first_text, status_txt, href = _extract_first_row(after_html)
+
+            if before_first and first_text and first_text == before_first:
+                return "Start Import apasat, dar nu a aparut un import nou in lista."
+
+            if not first_text:
+                try:
+                    os.makedirs("debug_artifacts", exist_ok=True)
+                    await page.screenshot(path="debug_artifacts/gomag_import_list_empty.png", full_page=True)
+                    with open("debug_artifacts/gomag_import_list_empty.html", "w", encoding="utf-8") as f:
+                        f.write(after_html)
+                except Exception:
+                    pass
+                return "Import nou detectat, dar nu am putut extrage randul din lista (tabel lipsa/HTML gol). Am salvat debug_artifacts/gomag_import_list_empty.*"
+
+            # If errors, try open details and extract
+            if "erori" in (status_txt or "").lower() or "erori" in first_text.lower():
+                if href:
+                    if href.startswith("/"):
+                        det_url = base + href
+                    elif href.startswith("http"):
+                        det_url = href
+                    else:
+                        det_url = base + "/" + href.lstrip("/")
+                    det_html = await _goto_and_get_html(det_url)
+                    soup = BeautifulSoup(det_html or "", "lxml")
+                    if "Erori Import" in soup.get_text(" ", strip=True):
+                        errs = []
+                        for tr in soup.select("table tbody tr")[:10]:
+                            tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+                            if tds:
+                                errs.append(" | ".join(tds))
+                        if errs:
+                            return "Finalizat cu erori. Primele erori:\n- " + "\n- ".join(errs)
+
+                return f"Finalizat cu erori. Status='{status_txt}'. Primul rand: {first_text[:200]}"
+
+            return f"OK: import nou detectat. Status='{status_txt}'. Primul rand: {first_text[:200]}"
+
         finally:
             await context.close()
             await browser.close()
-
 
 def import_file(creds: GomagCreds, file_path: str) -> str:
     return asyncio.run(import_file_async(creds, file_path))
