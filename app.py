@@ -1,5 +1,7 @@
 from __future__ import annotations
 import streamlit as st
+import time
+from concurrent.futures import ThreadPoolExecutor
 # --- PSI ProductFinder creds -> env (for scrapers) ---
 import os as _os
 try:
@@ -25,7 +27,7 @@ from src.gomag_ui import GomagCreds, fetch_categories, import_file
 
 st.set_page_config(page_title="Gomag Importer", layout="wide")
 st.title("Import produse in Gomag")
-st.caption("Import")
+st.caption("Flux: Excel -> preluare date -> tabel intermediar -> genereaza XLSX import -> (optional) browser automation import in Gomag")
 
 with st.sidebar:
     st.divider()
@@ -153,12 +155,65 @@ if st.session_state["drafts"]:
             if not export_path:
                 st.error("Genereaza mai intai XLSX (butonul de mai sus).")
             else:
-                with st.spinner("Import in Gomag..."):
-                    try:
-                        msg = import_file(creds, export_path)
-                        st.success(msg)
-                    except Exception as e:
-                        st.error(f"Eroare import: {e}")
+                # Ruleaza importul in thread + progres, ca sa nu para blocat
+
+                with st.status("Import in Gomag...", expanded=True) as status:
+
+                    status.write("Pornesc automatizarea (Playwright)...")
+
+                    executor = ThreadPoolExecutor(max_workers=1)
+
+                    fut = executor.submit(import_file, creds, export_path)
+
+                    t0 = time.time()
+
+                    timeout_s = 300  # 5 minute
+
+                    last_tick = -1
+
+
+                    while not fut.done():
+
+                        elapsed = int(time.time() - t0)
+
+                        if elapsed != last_tick and elapsed % 3 == 0:
+
+                            status.write(f"Inca ruleaza... {elapsed}s")
+
+                            last_tick = elapsed
+
+                        if elapsed >= timeout_s:
+
+                            status.update(label="Timeout import", state="error", expanded=True)
+
+                            st.error(
+
+                                "Importul dureaza prea mult. Cel mai probabil Gomag ruleaza importul in fundal "
+
+                                "sau pagina s-a blocat. Verifica in Gomag: Produse > Import (lista importuri)."
+
+                            )
+
+                            break
+
+                        time.sleep(1)
+
+
+                    if fut.done():
+
+                        try:
+
+                            msg = fut.result()
+
+                            status.update(label="Import finalizat", state="complete", expanded=False)
+
+                            st.success(msg)
+
+                        except Exception as e:
+
+                            status.update(label="Eroare import", state="error", expanded=True)
+
+                            st.error(f"Eroare import: {e}")
 
     with col3:
         st.info("Tip: Fa o importare manuala o data in Gomag ca sa salvezi maparea coloanelor; apoi automatizarea devine mai stabila.")
