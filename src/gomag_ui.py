@@ -250,7 +250,8 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
     cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
 
-    url = creds.base_url.rstrip("/") + cfg["gomag"]["import"]["url_path"]
+    base = creds.base_url.rstrip("/")
+    url = base + cfg["gomag"]["import"]["url_path"]
 
     async with async_playwright() as p:
         browser, context, page = await _launch_ctx(p)
@@ -270,20 +271,17 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             except Exception:
                 pass
 
-            # IMPORTANT: ignore VAT fields to avoid parent/variant mismatch
-            # Un-map (uncheck) columns mapped to "Pretul Include TVA" and "Cota TVA" if present.
+            # Ignore VAT fields to avoid parent/variant mismatch
             try:
                 await page.evaluate("""() => {
                     const targets = ['Pretul Include TVA', 'Prețul Include TVA', 'Cota TVA'];
                     const norm = (s) => (s||'').toLowerCase().replace(/\s+/g,' ').trim();
                     const tnorm = targets.map(norm);
-
                     const nodes = Array.from(document.querySelectorAll('th, td, label, div, span'));
                     for (const el of nodes) {
                         const txt = norm(el.textContent);
                         if (!txt) continue;
                         if (!tnorm.some(t => txt.includes(t))) continue;
-
                         let root = el.closest('th') || el.closest('td') || el.closest('label') || el.parentElement;
                         if (!root) continue;
                         const cb = root.querySelector('input[type="checkbox"]');
@@ -301,7 +299,7 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             except Exception:
                 pass
 
-            # Click Start Import (text-based, then config selector fallback)
+            # Click Start Import
             clicked = False
             try:
                 btn = page.locator('button:has-text("Start Import"), a:has-text("Start Import"), [role="button"]:has-text("Start Import")').first
@@ -319,13 +317,102 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
                     clicked = False
 
             if not clicked:
+                return "Am incarcat fisierul, dar nu am putut porni importul automat (nu gasesc/click pe 'Start Import')."
+
+            # --- Wait & verify results ---
+            # Gomag runs imports async; after pressing Start Import, it may take some seconds.
+            # We poll the import list page and look for status / error counts.
+            list_candidates = [
+                "/gomag/product/import/list",
+                "/gomag/product/import",
+                "/gomag/product/imports",
+                "/gomag/product/import/list?sort=created_desc",
+            ]
+
+            async def _get_text_snip() -> str:
+                try:
+                    html = await page.content()
+                    soup = BeautifulSoup(html or "", "lxml")
+                    return (soup.get_text("\n", strip=True) or "")[:500]
+                except Exception:
+                    return ""
+
+            def _parse_list(html: str):
+                soup = BeautifulSoup(html or "", "lxml")
+                row = soup.select_one("table tbody tr")
+                if not row:
+                    return None
+                tds = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+                txt = " | ".join(tds)
+                nums = [int(x) for x in re.findall(r"\b(\d+)\b", txt)]
+                return {"raw": txt[:250], "nums": nums, "tds": tds}
+
+            # Wait a bit on current page too (sometimes it shows progress/errors)
+            await _wait_render(page, 2500)
+
+            found_list = None
+            last_debug = ""
+            for attempt in range(1, 11):  # ~ up to ~1 minute (networkidle waits + sleep)
+                # First, check if errors table exists on current page
+                try:
+                    if await page.locator("text=Erori Import").count() > 0:
+                        # extract first few error rows
+                        rows = page.locator("table tbody tr")
+                        n = await rows.count()
+                        errs = []
+                        for i in range(min(n, 5)):
+                            t = await rows.nth(i).inner_text()
+                            errs.append(re.sub(r"\s+", " ", t).strip())
+                        return "Import pornit, dar Gomag a raportat erori:\n- " + "\n- ".join(errs)
+                except Exception:
+                    pass
+
+                # Visit list pages and parse first row
+                for path in list_candidates:
+                    try:
+                        await _goto_with_fallback(page, base + path)
+                        await _wait_render(page, 1600)
+                        html = await page.content()
+                        parsed = _parse_list(html)
+                        if parsed:
+                            found_list = (path, parsed)
+                            break
+                        last_debug = await _get_text_snip()
+                    except Exception:
+                        continue
+
+                if found_list:
+                    break
+
+                await page.wait_for_timeout(3500)
+
+            # Save artifacts for troubleshooting
+            try:
+                os.makedirs("debug_artifacts", exist_ok=True)
+                await page.screenshot(path="debug_artifacts/gomag_after_startimport.png", full_page=True)
+                html = await page.content()
+                with open("debug_artifacts/gomag_after_startimport.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+            except Exception:
+                pass
+
+            if not found_list:
                 return (
-                    "Am incarcat fisierul, dar nu am putut porni importul automat. "
-                    "Te rog apasa manual butonul 'Start Import'."
+                    "Import pornit (Start Import apasat), dar nu am putut gasi pagina de lista a importurilor sau un rezumat. "
+                    "Posibil importul ruleaza in fundal. Verifica manual in Gomag: Produse > Import (lista importuri). "
+                    f"Debug snippet: {last_debug}"
                 )
 
-            await page.wait_for_timeout(2500)
-            return "Import pornit (Start Import apasat)."
+            path, parsed = found_list
+            nums = parsed.get("nums", [])
+            raw = parsed.get("raw", "")
+            # Heuristic: if we see at least two numbers, interpret as products/errors
+            msg = f"Import pornit. Lista importuri ({path}): {raw}"
+            if len(nums) >= 2:
+                msg += f" (numere detectate: {nums[:4]})"
+            msg += " | Daca vezi 0 produse importate, cel mai sigur e sa exportam TSV (TAB) in loc de XLSX."
+            return msg
+
         finally:
             await context.close()
             await browser.close()
