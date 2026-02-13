@@ -1,6 +1,34 @@
+from __future__ import annotations
+import streamlit as st
+# --- PSI ProductFinder creds -> env (for scrapers) ---
+import os as _os
+try:
+    _os.environ["PSI_USER"] = str(st.secrets.get("SOURCES", {}).get("PSI_USER", "")).strip()
+    _os.environ["PSI_PASS"] = str(st.secrets.get("SOURCES", {}).get("PSI_PASS", "")).strip()
+except Exception:
+    pass
+
+# --- XDConnects creds -> env (for scrapers) ---
+import os as _os
+try:
+    _os.environ["XD_USER"] = str(st.secrets.get("SOURCES", {}).get("XD_USER", "")).strip()
+    _os.environ["XD_PASS"] = str(st.secrets.get("SOURCES", {}).get("XD_PASS", "")).strip()
+except Exception:
+    pass
+
+import pandas as pd
+import tempfile
+from src.utils import detect_url_column
+from src.pipeline import scrape_products
+from src.export_gomag import to_gomag_dataframe, save_xlsx
+from src.gomag_ui import GomagCreds, fetch_categories, import_file
+
+st.set_page_config(page_title="Gomag Importer", layout="wide")
+st.title("Import produse in Gomag")
+st.caption("Flux: Excel -> preluare date -> tabel intermediar -> genereaza XLSX import -> (optional) browser automation import in Gomag")
 
 # =====================
-# Debug artifacts panel (top)
+# Debug artifacts panel (sidebar)
 # =====================
 with st.sidebar.expander("Debug (download artifacts)", expanded=False):
     dbg_dir = "debug_artifacts"
@@ -33,35 +61,6 @@ with st.sidebar.expander("Debug (download artifacts)", expanded=False):
                     st.error(f"Nu pot citi {fn}: {e}")
     else:
         st.info("Folderul debug_artifacts/ nu exista (inca). Ruleaza o data importul ca sa se genereze fisiere.")
-
-from __future__ import annotations
-import streamlit as st
-# --- PSI ProductFinder creds -> env (for scrapers) ---
-import os as _os
-try:
-    _os.environ["PSI_USER"] = str(st.secrets.get("SOURCES", {}).get("PSI_USER", "")).strip()
-    _os.environ["PSI_PASS"] = str(st.secrets.get("SOURCES", {}).get("PSI_PASS", "")).strip()
-except Exception:
-    pass
-
-# --- XDConnects creds -> env (for scrapers) ---
-import os as _os
-try:
-    _os.environ["XD_USER"] = str(st.secrets.get("SOURCES", {}).get("XD_USER", "")).strip()
-    _os.environ["XD_PASS"] = str(st.secrets.get("SOURCES", {}).get("XD_PASS", "")).strip()
-except Exception:
-    pass
-
-import pandas as pd
-import tempfile
-from src.utils import detect_url_column
-from src.pipeline import scrape_products
-from src.export_gomag import to_gomag_dataframe, save_xlsx
-from src.gomag_ui import GomagCreds, fetch_categories, import_file
-
-st.set_page_config(page_title="Gomag Importer", layout="wide")
-st.title("Import produse in Gomag")
-st.caption("Flux: Excel -> preluare date -> tabel intermediar -> genereaza XLSX import -> (optional) browser automation import in Gomag")
 
 with st.sidebar:
     st.divider()
