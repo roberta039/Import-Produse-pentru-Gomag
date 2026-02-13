@@ -6,6 +6,23 @@ import yaml
 import streamlit as st
 from playwright.async_api import async_playwright
 
+# --- Playwright TLS/SSL workaround for Streamlit Cloud ---
+async def _launch_ctx(p):
+    """Launch chromium with SSL-ignore and return (browser, context, page)."""
+    browser = await p.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--ignore-certificate-errors",
+        ],
+    )
+    context = await browser.new_context(ignore_https_errors=True)
+    page = await context.new_page()
+    return browser, context, page
+
+
 @dataclass
 class GomagCreds:
     base_url: str
@@ -28,11 +45,24 @@ async def _login(page, creds: GomagCreds, cfg):
 async def fetch_categories_async(creds: GomagCreds) -> List[str]:
     cfg = _load_cfg()
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        browser, context, page = await _launch_ctx(p)
         await _login(page, creds, cfg)
         url = creds.base_url.rstrip("/") + cfg["gomag"]["categories"]["url_path"]
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            # fallback to http if https handshake fails
+            if url.startswith("https://"):
+                await page.goto("http://" + url[len("https://"):], wait_until="domcontentloaded", timeout=60000)
+            else:
+                raise
+        except Exception:
+            # fallback to http if https handshake fails
+            if url.startswith("https://"):
+                await page.goto("http://" + url[len("https://"):], wait_until="domcontentloaded", timeout=60000)
+            else:
+                raise
         await page.wait_for_timeout(1000)
         items = await page.query_selector_all(cfg["gomag"]["categories"]["item_selector"])
         cats = []
@@ -43,6 +73,7 @@ async def fetch_categories_async(creds: GomagCreds) -> List[str]:
                     cats.append(txt)
             except Exception:
                 continue
+        await context.close()
         await browser.close()
         # fallback: if none, return empty
         return cats
@@ -53,12 +84,25 @@ def fetch_categories(creds: GomagCreds) -> List[str]:
 async def import_file_async(creds: GomagCreds, file_path: str) -> str:
     cfg = _load_cfg()
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        browser, context, page = await _launch_ctx(p)
         await _login(page, creds, cfg)
 
         url = creds.base_url.rstrip("/") + cfg["gomag"]["import"]["url_path"]
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            # fallback to http if https handshake fails
+            if url.startswith("https://"):
+                await page.goto("http://" + url[len("https://"):], wait_until="domcontentloaded", timeout=60000)
+            else:
+                raise
+        except Exception:
+            # fallback to http if https handshake fails
+            if url.startswith("https://"):
+                await page.goto("http://" + url[len("https://"):], wait_until="domcontentloaded", timeout=60000)
+            else:
+                raise
         await page.wait_for_timeout(1000)
 
         # upload
@@ -69,10 +113,12 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=5000)
         except Exception:
             # Gomag poate cere mapare coloane manual la prima importare
-            await browser.close()
+            await context.close()
+        await browser.close()
             return "Am incarcat fisierul, dar nu am putut porni importul automat (probabil e nevoie de mapare coloane manual la prima rulare)."
 
         await page.wait_for_timeout(2000)
+        await context.close()
         await browser.close()
         return "Import pornit (daca Gomag nu a cerut pasi suplimentari)."
 
