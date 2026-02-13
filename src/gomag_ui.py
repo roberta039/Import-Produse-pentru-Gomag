@@ -250,7 +250,6 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
     cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
 
-    # Use explicit import/add endpoint (this is where the upload + mapping + Start Import are)
     url = creds.base_url.rstrip("/") + cfg["gomag"]["import"]["url_path"]
 
     async with async_playwright() as p:
@@ -261,62 +260,87 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             await _goto_with_fallback(page, url)
             await _wait_render(page, 1000)
 
-            # 1) Upload the file (Gomag uses a hidden <input type=file> with onchange=sendFile(...))
-            file_input_sel = cfg["gomag"]["import"].get("file_input_selector", "input[type='file']")
-            await page.wait_for_selector(file_input_sel, timeout=30000)
-            await page.set_input_files(file_input_sel, file_path)
+            # upload# Robust upload: Gomag may hide input[type=file] or place it in iframes.
+file_input_sel = cfg["gomag"]["import"].get("file_input_selector", 'input[type="file"]')
 
-            # 2) Wait until Gomag processes the upload and injects the mapping UI (it sets a hidden #_source)
-            try:
-                await page.wait_for_selector("input#_source", timeout=30000)
-            except Exception:
-                pass
+uploaded = False
+last_err = None
 
-            # 3) Try auto-correlate columns (this usually fills required fields like SKU)
+async def _try_upload_in_locator(loc):
+    nonlocal uploaded, last_err
+    try:
+        cnt = await loc.count()
+        if cnt == 0:
+            return False
+        for i in range(cnt):
             try:
-                if await page.locator("#corelate_columns").count() > 0:
-                    await page.check("#corelate_columns", timeout=5000)
-                    # give JS a moment to fill fields
-                    await page.wait_for_timeout(1500)
-            except Exception:
-                pass
+                await loc.nth(i).set_input_files(file_path, timeout=60000)
+                return True
+            except Exception as e:
+                last_err = e
+                continue
+        return False
+    except Exception as e:
+        last_err = e
+        return False
 
-            # 4) If SKU is still missing, we cannot proceed reliably without manual mapping
-            #    (Gomag requires at least "Cod Produs (SKU)")
-            try:
-                sku_filled = await page.evaluate(
-                    "() => Array.from(document.querySelectorAll('input.selectedFields')).some(i => (i.value||'').trim().length>0)"
-                )
-            except Exception:
-                sku_filled = True  # don't block if we can't evaluate
+# Make visible (best effort)
+try:
+    await page.evaluate("""() => {
+        document.querySelectorAll('input[type=file]').forEach(el => {
+            el.style.display='block';
+            el.style.visibility='visible';
+            el.style.opacity='1';
+            el.removeAttribute('hidden');
+        });
+    }""")
+except Exception:
+    pass
 
-            # 5) Click "Start Import"
+# 1) Any input[type=file] on page
+uploaded = await _try_upload_in_locator(page.locator('input[type="file"]'))
+
+# 2) Configured selector
+if not uploaded and file_input_sel and file_input_sel != 'input[type="file"]':
+    uploaded = await _try_upload_in_locator(page.locator(file_input_sel))
+
+# 3) Any input[type=file] in frames
+if not uploaded:
+    for fr in page.frames:
+        if fr == page.main_frame:
+            continue
+        try:
+            if await _try_upload_in_locator(fr.locator('input[type="file"]')):
+                uploaded = True
+                break
+        except Exception as e:
+            last_err = e
+            continue
+
+if not uploaded:
+    try:
+        os.makedirs("debug_artifacts", exist_ok=True)
+        await page.screenshot(path="debug_artifacts/gomag_upload_no_file_input.png", full_page=True)
+        with open("debug_artifacts/gomag_upload_no_file_input.html", "w", encoding="utf-8") as f:
+            f.write(await page.content())
+    except Exception:
+        pass
+    raise RuntimeError(f"Upload esuat: nu am gasit input[type=file] utilizabil. Ultima eroare: {last_err}")
+# attempt start
             try:
-                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=10000, force=True)
+                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=5000)
             except Exception:
                 return (
-                    "Am incarcat fisierul, dar nu am putut apasa 'Start Import' automat. "
-                    "Verifica manual pe pagina de import."
+                    "Am incarcat fisierul, dar nu am putut porni importul automat "
+                    "(probabil e nevoie de mapare coloane manual la prima rulare)."
                 )
 
-            # If Gomag still shows warning about missing fields, tell user to map once
-            try:
-                warning = await page.locator("div.-g2-messages.-g2-warning").first.text_content(timeout=2000)
-                if warning and "introduceti toate informatiile necesare" in warning.lower():
-                    return (
-                        "Fisierul a fost incarcat, dar Gomag cere maparea coloanelor (cel putin SKU). "
-                        "Bifeaza 'Coreleaza automat coloanele...' sau mapeaza o data manual si salveaza template-ul."
-                    )
-            except Exception:
-                pass
-
-            await page.wait_for_timeout(1500)
-            return "Start Import apasat. Gomag ruleaza importul in fundal. Verifica lista de importuri pentru status/erori."
+            await page.wait_for_timeout(2000)
+            return "Import pornit (daca Gomag nu a cerut pasi suplimentari)."
         finally:
             await context.close()
             await browser.close()
 
 
 def import_file(creds: GomagCreds, file_path: str) -> str:
-
     return asyncio.run(import_file_async(creds, file_path))
