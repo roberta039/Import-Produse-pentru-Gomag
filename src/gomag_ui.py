@@ -250,82 +250,34 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
     cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
 
-    base = _normalize_base_url(creds.base_url).rstrip("/")
-
-    # Candidate import paths (Gomag endpoints differ by account/version)
-    cfg_path = cfg.get("gomag", {}).get("import", {}).get("url_path") or ""
-    candidates = [p for p in [
-        cfg_path,
-        "/gomag/product/import",
-        "/gomag/product/import/list",
-        "/gomag/product/imports",
-        "/gomag/dashboard/products/import",
-        "/gomag/products/import",
-        "/gomag/product/importer",
-    ] if p]
+    url = creds.base_url.rstrip("/") + cfg["gomag"]["import"]["url_path"]
 
     async with async_playwright() as p:
         browser, context, page = await _launch_ctx(p)
         try:
             await _login(page, creds, cfg)
 
-            last_nav_err = None
-            chosen = None
-            for path in candidates:
-                url = base + (path if path.startswith("/") else "/" + path)
-                try:
-                    await _goto_with_fallback(page, url)
-                    await _wait_render(page, 1200)
-                    html = await page.content()
-                    # accept if DOM is not empty shell
-                    if html and "<body></body>" not in html.replace(" ", ""):
-                        chosen = url
-                        break
-                except Exception as e:
-                    last_nav_err = e
-                    continue
+            await _goto_with_fallback(page, url)
+            await _wait_render(page, 1000)
 
-            if not chosen:
-                raise RuntimeError(f"Nu am gasit pagina de import valida. Ultima eroare: {last_nav_err}")
+            # upload
+            await page.set_input_files(cfg["gomag"]["import"]["file_input_selector"], file_path)
 
-            # 1) try config file input selector
-            note = ""
-            file_sel = cfg.get("gomag", {}).get("import", {}).get("file_input_selector")
-            if file_sel:
-                try:
-                    loc = page.locator(file_sel).first
-                    await loc.wait_for(state="attached", timeout=15000)
-                    await loc.set_input_files(file_path, timeout=30000)
-                    note = f"cfg:{file_sel}"
-                except Exception:
-                    note = ""
-
-            # 2) try generic input search
-            if not note:
-                try:
-                    note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)
-                except Exception:
-                    note = ""
-
-            # 3) file chooser sweep fallback
-            if not note:
-                note = await _upload_via_filechooser_sweep(page, file_path)
-
-            await _wait_render(page, 1200)
-
-            # Start import (if exists)
+            # attempt start
             try:
-                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=7000)
-                await page.wait_for_timeout(1500)
-                return f"Fisier incarcat ({note}). Import pornit (daca Gomag nu a cerut pasi suplimentari). Pagina: {chosen}"
+                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=5000)
             except Exception:
                 return (
-                    f"Fisier incarcat ({note}). Nu am putut porni importul automat "
-                    f"(probabil e nevoie de mapare coloane/manual la prima rulare). Pagina: {chosen}"
+                    "Am incarcat fisierul, dar nu am putut porni importul automat "
+                    "(probabil e nevoie de mapare coloane manual la prima rulare)."
                 )
+
+            await page.wait_for_timeout(2000)
+            return "Import pornit (daca Gomag nu a cerut pasi suplimentari)."
         finally:
             await context.close()
             await browser.close()
+
 
 def import_file(creds: GomagCreds, file_path: str) -> str:
     return asyncio.run(import_file_async(creds, file_path))
