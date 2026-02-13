@@ -25,7 +25,7 @@ from src.gomag_ui import GomagCreds, fetch_categories, import_file
 
 st.set_page_config(page_title="Gomag Importer", layout="wide")
 st.title("Import produse in Gomag")
-st.caption()
+st.caption("Import")
 
 with st.sidebar:
     st.divider()
