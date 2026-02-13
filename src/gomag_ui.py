@@ -6,11 +6,19 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional, Tuple
 
 import yaml
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+
+
+# --- URL normalization (force https for Gomag where possible) ---
+def _normalize_base_url(base_url: str) -> str:
+    base = (base_url or "").strip()
+    if base.startswith("http://"):
+        return "https://" + base[len("http://"):].lstrip("/")
+    return base
 
 
 # ============================================================
@@ -23,10 +31,6 @@ def _pw_writable_browsers_path() -> str:
 
 
 def _ensure_playwright_chromium_installed() -> None:
-    """
-    Ensure Playwright Chromium exists. Safe for Streamlit Cloud.
-    Installs into a writable path: ~/.cache/ms-playwright
-    """
     if os.environ.get("PW_CHROMIUM_READY") == "1":
         return
 
@@ -73,23 +77,42 @@ async def _launch_ctx(p):
 
 
 async def _goto_with_fallback(page, url: str):
-    """
-    Fix pentru ERR_SSL_PROTOCOL_ERROR:
-    - încearcă https
-    - dacă pică handshake-ul, încearcă http
-    """
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        return
-    except Exception:
-        if url.startswith("https://"):
-            await page.goto("http://" + url[len("https://"):], wait_until="domcontentloaded", timeout=60000)
+    url = (url or "").strip()
+    if url.startswith("http://"):
+        primary = "https://" + url[len("http://"):]
+    else:
+        primary = url
+    fallback = "http://" + primary[len("https://"):] if primary.startswith("https://") else None
+
+    last_err = None
+    for target in [primary, fallback] if fallback else [primary]:
+        if not target:
+            continue
+        try:
+            resp = await page.goto(target, wait_until="domcontentloaded", timeout=120000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=45000)
+            except Exception:
+                pass
+            if resp is not None and resp.status >= 400:
+                raise RuntimeError(f"HTTP {resp.status} at {target}")
+            html = await page.content()
+            if html.strip().replace(" ", "") in ("<html><head></head><body></body></html>",):
+                await page.wait_for_timeout(1500)
+                await page.reload(wait_until="domcontentloaded", timeout=120000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=45000)
+                except Exception:
+                    pass
             return
-        raise
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"Navigation failed. primary={primary} fallback={fallback} last={last_err}")
 
 
 async def _wait_render(page, extra_ms: int = 800):
-    # Pentru pagini cu XHR: networkidle e mai robust
     try:
         await page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
@@ -97,57 +120,8 @@ async def _wait_render(page, extra_ms: int = 800):
     await page.wait_for_timeout(extra_ms)
 
 
-def _looks_like_login(html: str) -> bool:
-    s = (html or "").lower()
-    return ("type=\"password\"" in s) and ("login" in s or "autent" in s or "parol" in s)
-
-
-def _dedupe_keep_order(items: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for x in items:
-        x = re.sub(r"\s+", " ", (x or "").strip())
-        if not x:
-            continue
-        key = x.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(x)
-    return out
-
-
-def _parse_categories_from_html(html: str) -> List[str]:
-    soup = BeautifulSoup(html or "", "lxml")
-
-    cats: List[str] = []
-
-    # 1) tabel - prima coloana
-    rows = soup.select("table tbody tr")
-    for tr in rows:
-        tds = tr.find_all("td")
-        if not tds:
-            continue
-        name = tds[0].get_text(" ", strip=True).replace("\u00a0", " ").strip()
-        name = name.split("ID:")[0].strip()
-        if name:
-            cats.append(name)
-
-    cats = _dedupe_keep_order(cats)
-    if cats:
-        return cats
-
-    # 2) fallback: link-uri care par a fi categorii
-    for a in soup.select('a[href*="/gomag/product/category"]'):
-        txt = a.get_text(" ", strip=True)
-        if txt and len(txt) < 80:
-            cats.append(txt)
-
-    return _dedupe_keep_order(cats)
-
-
 # ============================================================
-# Gomag UI API (folosit de app.py)
+# Config + Login
 # ============================================================
 
 @dataclass
@@ -164,26 +138,92 @@ def _load_cfg():
 
 
 async def _login(page, creds: GomagCreds, cfg):
-    login_url = creds.base_url.rstrip("/") + (creds.dashboard_path or "/gomag/dashboard")
-    await _goto_with_fallback(page, login_url)
-    await _wait_render(page, 600)
+    base = _normalize_base_url(creds.base_url).rstrip("/")
+    login_url = base + (creds.dashboard_path or "/gomag/dashboard")
 
-    # selectori din config.yaml (compatibil cu versiunea ta)
+    await _goto_with_fallback(page, login_url)
+    await _wait_render(page, 700)
+
     await page.fill(cfg["gomag"]["login"]["username_selector"], creds.username)
     await page.fill(cfg["gomag"]["login"]["password_selector"], creds.password)
-    await page.click(cfg["gomag"]["login"]["submit_selector"])
+
+    try:
+        await page.click(cfg["gomag"]["login"]["submit_selector"], timeout=8000)
+    except Exception:
+        await page.keyboard.press("Enter")
 
     await _wait_render(page, int(cfg["gomag"]["login"].get("post_login_wait", 2.0) * 1000))
+
+
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in items:
+        x = re.sub(r"\s+", " ", (x or "").strip())
+        if not x:
+            continue
+        k = x.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(x)
+    return out
+
+
+def _looks_like_login(html: str) -> bool:
+    s = (html or "").lower()
+    return ("type=\"password\"" in s) and ("login" in s or "autent" in s or "parol" in s)
+
+
+# ============================================================
+# Categories
+# ============================================================
+
+def _parse_categories_from_html(html: str) -> List[str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    cats: List[str] = []
+
+    rows = soup.select("table tbody tr")
+    for tr in rows:
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+        name = tds[0].get_text(" ", strip=True).replace("\u00a0", " ").strip()
+        name = name.split("ID:")[0].strip()
+        low = name.lower()
+        if not name:
+            continue
+        if low in {"categorie", "categorii", "actiuni", "acțiuni", "nume", "name"}:
+            continue
+        if len(name) < 2 or len(name) > 80:
+            continue
+        cats.append(name)
+
+    cats = _dedupe_keep_order(cats)
+    if cats:
+        return cats
+
+    for a in soup.select('a[href*="/gomag/product/category"]'):
+        txt = a.get_text(" ", strip=True)
+        if not txt:
+            continue
+        low = txt.lower()
+        if low in {"categorie", "categorii"}:
+            continue
+        if len(txt) < 2 or len(txt) > 80:
+            continue
+        cats.append(txt)
+
+    return _dedupe_keep_order(cats)
 
 
 async def fetch_categories_async(creds: GomagCreds) -> List[str]:
     cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
 
-    # IMPORTANT: user a confirmat URL-ul corect:
-    # /gomag/product/category/list
+    base = _normalize_base_url(creds.base_url).rstrip("/")
     url_path = cfg.get("gomag", {}).get("categories", {}).get("url_path") or "/gomag/product/category/list"
-    url = creds.base_url.rstrip("/") + url_path
+    url = base + url_path
 
     async with async_playwright() as p:
         browser, context, page = await _launch_ctx(p)
@@ -191,51 +231,22 @@ async def fetch_categories_async(creds: GomagCreds) -> List[str]:
             await _login(page, creds, cfg)
 
             await _goto_with_fallback(page, url)
-            await _wait_render(page, 1200)
+            await _wait_render(page, 1400)
 
-            # 1) încearcă selectorul din config (dacă există)
-            cats: List[str] = []
-            item_selector = cfg.get("gomag", {}).get("categories", {}).get("item_selector")
-            if item_selector:
-                try:
-                    await page.wait_for_selector(item_selector, timeout=15000)
-                except Exception:
-                    pass
-                try:
-                    items = await page.query_selector_all(item_selector)
-                    for it in items:
-                        try:
-                            txt = (await it.inner_text()).strip()
-                            if txt:
-                                cats.append(txt)
-                        except Exception:
-                            continue
-                    cats = _dedupe_keep_order(cats)
-                except Exception:
-                    cats = []
+            try:
+                await page.wait_for_selector("table tbody tr, a[href*='/gomag/product/category']", timeout=20000)
+            except Exception:
+                pass
 
-            # 2) dacă selectorul nu a produs nimic, parsează HTML (tabel/link-uri)
+            await _wait_render(page, 800)
+            html = await page.content()
+
+            if _looks_like_login(html):
+                raise RuntimeError("Login Gomag a esuat sau sesiunea nu s-a pastrat (am ajuns inapoi la pagina de login).")
+
+            cats = _parse_categories_from_html(html)
             if not cats:
-                # așteaptă orice indicator de listă: tabel sau link-uri de categorie
-                try:
-                    await page.wait_for_selector("table tbody tr, a[href*='/gomag/product/category']", timeout=20000)
-                except Exception:
-                    pass
-                await _wait_render(page, 800)
-                html = await page.content()
-
-                if _looks_like_login(html):
-                    raise RuntimeError(
-                        "Login Gomag a esuat sau sesiunea nu s-a pastrat (am ajuns inapoi la pagina de login)."
-                    )
-
-                cats = _parse_categories_from_html(html)
-
-            if not cats:
-                raise RuntimeError(
-                    "Nu am putut extrage categoriile (pagina s-a incarcat, dar nu am gasit tabelul/link-urile)."
-                )
-
+                raise RuntimeError("Nu am putut extrage categoriile (pagina s-a incarcat, dar nu am gasit tabelul/link-urile).")
             return cats
         finally:
             await context.close()
@@ -246,11 +257,122 @@ def fetch_categories(creds: GomagCreds) -> List[str]:
     return asyncio.run(fetch_categories_async(creds))
 
 
+# ============================================================
+# Import helpers
+# ============================================================
+
+async def _set_input_files_anywhere(page, file_path: str, timeout_ms: int = 60000) -> str:
+    candidates = [
+        'input[type="file"]',
+        'input[type="file"][name]',
+        'input[type="file"][accept]',
+        'input[accept*="csv" i]',
+        'input[accept*="xls" i]',
+        'input[accept*="xlsx" i]',
+        'input',  # last resort (your current working message was Upload=input:input)
+    ]
+
+    for sel in candidates:
+        try:
+            loc = page.locator(sel).first
+            await loc.wait_for(state="attached", timeout=timeout_ms // 3)
+            try:
+                await page.evaluate(
+                    """(sel) => {
+                        const el = document.querySelector(sel);
+                        if (!el) return;
+                        el.style.display = 'block';
+                        el.style.visibility = 'visible';
+                        el.style.opacity = 1;
+                        el.removeAttribute('hidden');
+                    }""", sel
+                )
+            except Exception:
+                pass
+            await loc.set_input_files(file_path, timeout=timeout_ms // 3)
+            return f"input:{sel}"
+        except Exception:
+            continue
+
+    raise RuntimeError("Nu am gasit input pentru upload (nici macar generic).")
+
+
+async def _try_click_start_import(page) -> Tuple[bool, Optional[str]]:
+    start_selectors = [
+        'button:has-text("Start Import")',
+        'a:has-text("Start Import")',
+        '[role="button"]:has-text("Start Import")',
+        'text=Start Import',
+    ]
+    last_err = None
+    for sel in start_selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() == 0:
+                continue
+            await loc.scroll_into_view_if_needed(timeout=5000)
+            await loc.wait_for(state="visible", timeout=15000)
+            try:
+                await loc.click(timeout=8000, force=True)
+            except Exception:
+                await page.evaluate("(el) => el.click()", await loc.element_handle())
+            return True, None
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return False, last_err
+
+
+def _parse_import_list_counts(html: str) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    """Best-effort parse: returns (imported_products, errors, status_text)."""
+    soup = BeautifulSoup(html or "", "lxml")
+    # Try first table row in list page
+    row = soup.select_one("table tbody tr")
+    if not row:
+        return None, None, None
+    tds = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+    txt = " | ".join(tds)
+    # extract first two ints seen (often products / errors)
+    nums = [int(x) for x in re.findall(r"\b(\d+)\b", txt)]
+    imported = nums[0] if len(nums) > 0 else None
+    errors = nums[1] if len(nums) > 1 else None
+    status = tds[0] if tds else None
+    return imported, errors, txt[:200]
+
+
+async def _check_latest_import_result(page, base: str) -> str:
+    # Common list URL; if it 404s, we just return "unknown"
+    candidates = [
+        "/gomag/product/import/list",
+        "/gomag/product/import",
+        "/gomag/product/imports",
+    ]
+    last = None
+    for path in candidates:
+        try:
+            await _goto_with_fallback(page, base + path)
+            await _wait_render(page, 1200)
+            html = await page.content()
+            imported, errors, status = _parse_import_list_counts(html)
+            if imported is not None or errors is not None:
+                return f"Rezultat import (estimare): produse={imported}, erori={errors}, raw='{status}'"
+            last = path
+        except Exception:
+            continue
+    return f"Nu am putut verifica rezultatul (nu am gasit pagina list). Ultimul incercat: {last}"
+
+
+# ============================================================
+# Import in Gomag
+# ============================================================
+
 async def import_file_async(creds: GomagCreds, file_path: str) -> str:
     cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
 
-    url = creds.base_url.rstrip("/") + cfg["gomag"]["import"]["url_path"]
+    base = _normalize_base_url(creds.base_url).rstrip("/")
+    url_path = cfg.get("gomag", {}).get("import", {}).get("url_path") or "/gomag/product/import/add"
+    url = base + url_path
 
     async with async_playwright() as p:
         browser, context, page = await _launch_ctx(p)
@@ -260,117 +382,52 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             await _goto_with_fallback(page, url)
             await _wait_render(page, 1400)
 
-            # Upload (input selector from config OR FileChooser click selector if set)
-            uploaded_note = ""
-            file_sel = cfg.get("gomag", {}).get("import", {}).get("file_input_selector")
-            chooser_click = cfg.get("gomag", {}).get("import", {}).get("file_chooser_click_selector")
+            # Upload
+            note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)
+            await _wait_render(page, 1400)
 
-            if file_sel:
-                try:
-                    await page.set_input_files(file_sel, file_path, timeout=60000)
-                    uploaded_note = f"input:{file_sel}"
-                except Exception:
-                    uploaded_note = ""
-
-            if not uploaded_note and chooser_click:
-                try:
-                    loc = page.locator(chooser_click).first
-                    async with page.expect_file_chooser(timeout=20000) as fc_info:
-                        await loc.click(timeout=8000)
-                    fc = await fc_info.value
-                    await fc.set_files(file_path)
-                    uploaded_note = f"filechooser:{chooser_click}"
-                except Exception:
-                    uploaded_note = ""
-
-            if not uploaded_note:
-                # last resort: generic search (if helpers exist in your file)
-                try:
-                    uploaded_note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)  # type: ignore[name-defined]
-                except Exception:
-                    uploaded_note = ""
-
-            if not uploaded_note:
-                raise RuntimeError("Nu am reusit sa incarc fisierul (nici input selector, nici filechooser).")
-
-            # Wait for mapping section or Start Import button to appear
+            # Wait mapping section (best-effort)
             try:
-                await page.wait_for_selector('text="Alege Semnificatia" , text="Alege Semnificația" , text="Start Import"', timeout=45000)
-            except Exception:
-                pass
-            await _wait_render(page, 1200)
-
-            # Ensure automatic mapping checkbox is ON if present
-            try:
-                auto_lbl = page.get_by_text("Coreleaza automat", exact=False).first
-                if await auto_lbl.count() > 0:
-                    # click label to ensure checked
-                    await auto_lbl.click(timeout=2000)
+                await page.wait_for_selector('text="Alege Semnificatia", text="Alege Semnificația", text="Start Import"', timeout=45000)
             except Exception:
                 pass
 
-            # Scroll to top (Start Import is top-right)
+            # Scroll top and click Start Import
             try:
                 await page.evaluate("window.scrollTo(0, 0)")
                 await page.wait_for_timeout(400)
             except Exception:
                 pass
 
-            # Robust click Start Import (button OR link styled button)
-            start_selectors = [
-                'button:has-text("Start Import")',
-                'a:has-text("Start Import")',
-                'input[type="submit"][value*="Start" i]',
-                '[role="button"]:has-text("Start Import")',
-                'text=Start Import',
-            ]
-
-            clicked = False
-            last_click_err = None
-            for sel in start_selectors:
+            ok, last_err = await _try_click_start_import(page)
+            if not ok:
+                # Save debug
                 try:
-                    loc = page.locator(sel).first
-                    if await loc.count() == 0:
-                        continue
-                    await loc.scroll_into_view_if_needed(timeout=5000)
-                    await loc.wait_for(state="visible", timeout=15000)
-                    try:
-                        await loc.click(timeout=8000, force=True)
-                    except Exception:
-                        # JS click fallback
-                        try:
-                            await page.evaluate("(el) => el.click()", await loc.element_handle())
-                        except Exception as ee:
-                            raise ee
-                    clicked = True
-                    break
-                except Exception as e:
-                    last_click_err = e
-                    continue
+                    os.makedirs("debug_artifacts", exist_ok=True)
+                    await page.screenshot(path="debug_artifacts/gomag_after_upload.png", full_page=True)
+                    html = await page.content()
+                    with open("debug_artifacts/gomag_after_upload.html", "w", encoding="utf-8") as f:
+                        f.write(html)
+                except Exception:
+                    pass
+                return (
+                    "Am incarcat fisierul, dar nu am putut apasa 'Start Import'. "
+                    f"Upload={note}. Ultima eroare click: {last_err}."
+                )
 
-            if clicked:
-                await _wait_render(page, 2000)
-                return f"Import pornit (Start Import apasat). Upload={uploaded_note}"
+            # After clicking, wait a bit and try to detect any confirmation / progress
+            await _wait_render(page, 2500)
 
-            # Debug artifacts to see why button wasn't clickable/visible
-            try:
-                os.makedirs("debug_artifacts", exist_ok=True)
-                await page.screenshot(path="debug_artifacts/gomag_after_upload.png", full_page=True)
-                html = await page.content()
-                with open("debug_artifacts/gomag_after_upload.html", "w", encoding="utf-8") as f:
-                    f.write(html)
-            except Exception:
-                pass
+            # Verify result by checking import list page
+            result = await _check_latest_import_result(page, base)
 
-            return (
-                "Am incarcat fisierul, dar nu am putut porni importul automat. "
-                f"Upload={uploaded_note}. "
-                f"Ultima eroare click: {last_click_err}. "
-                "Am salvat debug_artifacts/gomag_after_upload.png si .html."
-            )
+            # If likely 0 imported, warn about file format (Gomag accepts XLS/TSV; XLSX may parse preview but import 0)
+            return f"Import pornit (Start Import apasat). Upload={note}. {result}"
+
         finally:
             await context.close()
             await browser.close()
+
 
 def import_file(creds: GomagCreds, file_path: str) -> str:
     return asyncio.run(import_file_async(creds, file_path))
