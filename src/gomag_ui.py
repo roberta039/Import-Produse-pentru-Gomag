@@ -1,20 +1,15 @@
 import asyncio
 import os
-import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import yaml
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
-# NOTE: Intentionally NO "from __future__ import annotations" to avoid SyntaxError in Streamlit patching.
-
-# -----------------------------
-# Playwright install (Streamlit)
-# -----------------------------
+# No __future__ import to avoid SyntaxError in patched environments.
 
 def _pw_writable_browsers_path() -> str:
     home = os.path.expanduser("~")
@@ -58,14 +53,12 @@ def _load_cfg() -> dict:
     if os.path.exists(cfg_path):
         with open(cfg_path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
-    # reasonable defaults
     return {
         "gomag": {
             "login": {
                 "email_selector": 'input[name="email"], input[type="email"]',
                 "password_selector": 'input[name="password"], input[type="password"]',
                 "submit_selector": 'button[type="submit"], button:has-text("Autentificare"), button:has-text("Login")',
-                "success_url_contains": "/gomag/",
             },
             "categories": {"url_path": "/gomag/product/category/list"},
             "import": {"url_path": "/gomag/product/import/add"},
@@ -74,7 +67,6 @@ def _load_cfg() -> dict:
 
 
 async def _goto_with_fallback(page, url: str):
-    # try https then http
     if url.startswith("http://"):
         https_url = "https://" + url[len("http://"):]
     elif url.startswith("https://"):
@@ -105,32 +97,31 @@ async def _login(page, creds: GomagCreds, cfg: dict):
     await _goto_with_fallback(page, base + "/gomag/dashboard")
     await _wait_render(page, 900)
 
-    email_sel = cfg["gomag"]["login"]["email_selector"]
-    pass_sel = cfg["gomag"]["login"]["password_selector"]
-    submit_sel = cfg["gomag"]["login"]["submit_selector"]
-
-    # Fill
-    await page.fill(email_sel, creds.email)
-    await page.fill(pass_sel, creds.password)
-    await page.click(submit_sel)
+    await page.fill(cfg["gomag"]["login"]["email_selector"], creds.email)
+    await page.fill(cfg["gomag"]["login"]["password_selector"], creds.password)
+    await page.click(cfg["gomag"]["login"]["submit_selector"])
     await _wait_render(page, 1500)
 
 
 def _parse_categories(html: str) -> List[Tuple[str, str]]:
     soup = BeautifulSoup(html or "", "lxml")
     out: List[Tuple[str, str]] = []
-    # Common: table rows with name column
+    # categories list page can be normal table or g2 div table
     for tr in soup.select("table tbody tr"):
         tds = tr.find_all("td")
-        if not tds:
-            continue
-        name = tds[0].get_text(" ", strip=True)
-        if not name:
-            continue
-        out.append((name, name))
-    # De-dup
+        if tds:
+            name = tds[0].get_text(" ", strip=True)
+            if name:
+                out.append((name, name))
+    for row in soup.select("#content .-g2-table .-g2-table-row:not(.-g2-table-head)"):
+        cols = row.select(":scope > .-g2-table-col")
+        if cols:
+            name = cols[0].get_text(" ", strip=True)
+            if name:
+                out.append((name, name))
+    # de-dup
     seen = set()
-    uniq = []
+    uniq: List[Tuple[str, str]] = []
     for k, v in out:
         if k in seen:
             continue
@@ -151,9 +142,7 @@ async def fetch_categories_async(creds: GomagCreds) -> List[Tuple[str, str]]:
             await _login(page, creds, cfg)
             await _goto_with_fallback(page, url)
             await _wait_render(page, 1600)
-            html = await page.content()
-            cats = _parse_categories(html)
-            return cats
+            return _parse_categories(await page.content())
         finally:
             await context.close()
             await browser.close()
@@ -165,15 +154,61 @@ def fetch_categories(creds: GomagCreds) -> List[Tuple[str, str]]:
 
 def _extract_first_row(html: str):
     soup = BeautifulSoup(html or "", "lxml")
-    row = soup.select_one("table tbody tr")
-    if not row:
-        return "", "", ""
-    tds = [td.get_text(" ", strip=True) for td in row.find_all("td")]
-    first_text = " | ".join([t for t in tds if t]).strip()
-    status_txt = (tds[-1] if tds else "").strip()
-    a = row.select_one("td a")
-    href = (a.get("href") if a else "") or ""
-    return first_text, status_txt, href.strip()
+
+    # Case A: classic <table>
+    tr = soup.select_one("table tbody tr")
+    if tr:
+        tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        first_text = " | ".join([t for t in tds if t]).strip()
+        status_txt = (tds[-1] if tds else "").strip()
+        a = tr.select_one("a")
+        href = (a.get("href") if a else "") or ""
+        # if there is an "err" link, prefer it
+        aerr = tr.select_one('a[href*="/gomag/product/import/err"]')
+        if aerr and aerr.get("href"):
+            href = aerr.get("href")
+        return first_text, status_txt, (href or "").strip()
+
+    # Case B: Gomag backend uses div-table (-g2-table)
+    row = soup.select_one("#content .-g2-table .-g2-table-row:not(.-g2-table-head)")
+    if row:
+        cols = row.select(":scope > .-g2-table-col")
+        tds = [c.get_text(" ", strip=True) for c in cols]
+        first_text = " | ".join([t for t in tds if t]).strip()
+        status_txt = tds[-1].strip() if tds else ""
+        aerr = row.select_one('a[href*="/gomag/product/import/err"]')
+        href = (aerr.get("href") if aerr else "") or ""
+        return first_text, status_txt, href.strip()
+
+    return "", "", ""
+
+
+def _extract_import_errors(html: str) -> List[str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    errors: List[str] = []
+
+    # Classic table errors
+    for tr in soup.select("table tbody tr")[:10]:
+        tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if tds:
+            errors.append(" | ".join(tds))
+
+    # g2 div-table errors (if used)
+    if not errors:
+        for row in soup.select("#content .-g2-table .-g2-table-row:not(.-g2-table-head)")[:10]:
+            cols = [c.get_text(" ", strip=True) for c in row.select(":scope > .-g2-table-col")]
+            cols = [c for c in cols if c]
+            if cols:
+                errors.append(" | ".join(cols))
+
+    # Sometimes errors are plain list items
+    if not errors:
+        for li in soup.select("#content li")[:10]:
+            t = li.get_text(" ", strip=True)
+            if t and len(t) > 5:
+                errors.append(t)
+
+    return errors
 
 
 async def import_file_async(creds: GomagCreds, file_path: str) -> str:
@@ -216,8 +251,7 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             except Exception:
                 pass
 
-            # robust upload (page + frames)
-            async def try_upload_in(loc) -> bool:
+            async def _try_upload_in(loc) -> bool:
                 try:
                     cnt = await loc.count()
                     for i in range(cnt):
@@ -230,12 +264,12 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
                     return False
                 return False
 
-            uploaded = await try_upload_in(page.locator('input[type="file"]'))
+            uploaded = await _try_upload_in(page.locator('input[type="file"]'))
             if not uploaded:
                 for fr in page.frames:
                     if fr == page.main_frame:
                         continue
-                    if await try_upload_in(fr.locator('input[type="file"]')):
+                    if await _try_upload_in(fr.locator('input[type="file"]')):
                         uploaded = True
                         break
             if not uploaded:
@@ -263,7 +297,7 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             await _wait_render(page, 1600)
             after_html = await page.content()
 
-            # sometimes HTML blank
+            # sometimes HTML blank, try reload
             if after_html.strip().replace(" ", "") == "<html><head></head><body></body></html>":
                 await page.wait_for_timeout(1200)
                 try:
@@ -283,7 +317,25 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
                 await page.screenshot(path="debug_artifacts/gomag_import_list_empty.png", full_page=True)
                 with open("debug_artifacts/gomag_import_list_empty.html", "w", encoding="utf-8") as f:
                     f.write(after_html)
-                return "Import nou detectat, dar nu am putut extrage randul din lista (tabel lipsa/HTML gol). Am salvat debug_artifacts/gomag_import_list_empty.*"
+                return "Import nou detectat, dar nu am putut extrage randul din lista (nu am gasit randuri in pagina). Am salvat debug_artifacts/gomag_import_list_empty.*"
+
+            # If we have an errors link, fetch it and extract first errors
+            if href:
+                if href.startswith("/"):
+                    err_url = base + href
+                elif href.startswith("http"):
+                    err_url = href
+                else:
+                    err_url = base + "/" + href.lstrip("/")
+
+                # If status indicates errors, read details
+                if "erori" in (status_txt or "").lower() or "erori" in first_text.lower():
+                    await _goto_with_fallback(page, err_url)
+                    await _wait_render(page, 1600)
+                    err_html = await page.content()
+                    errs = _extract_import_errors(err_html)
+                    if errs:
+                        return "Finalizat cu erori. Primele erori:\n- " + "\n- ".join(errs[:10])
 
             return f"OK: import nou detectat. Status='{status_txt}'. Primul rand: {first_text[:200]}"
         finally:
