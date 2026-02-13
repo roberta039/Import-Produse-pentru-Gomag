@@ -20,7 +20,7 @@ import pandas as pd
 import tempfile
 from src.utils import detect_url_column
 from src.pipeline import scrape_products
-from src.export_gomag import to_gomag_dataframe, save_tsv
+from src.export_gomag import to_gomag_dataframe, save_xlsx
 from src.gomag_ui import GomagCreds, fetch_categories, import_file
 
 st.set_page_config(page_title="Gomag Importer", layout="wide")
@@ -126,21 +126,21 @@ if st.session_state["drafts"]:
     st.subheader("4) Genereaza fisier import Gomag")
     col1, col2, col3 = st.columns([1,1,1])
     with col1:
-        if st.button("Genereaza TSV"):
+        if st.button("Genereaza XLSX"):
             # push category back into drafts via map
             category_map = {row["source_url"]: row.get("category","") for _, row in edited.iterrows()}
             df_gomag = to_gomag_dataframe(drafts, category_map=category_map)
 
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
             tmp.close()
-            save_tsv(df_gomag, tmp.name)
+            save_xlsx(df_gomag, tmp.name)
 
             with open(tmp.name, "rb") as f:
                 st.download_button(
-                    "Descarca import_gomag.tsv",
+                    "Descarca import_gomag.xlsx",
                     data=f,
-                    file_name="import_gomag.tsv",
-                    mime="text/tab-separated-values",
+                    file_name="import_gomag.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary"
                 )
             st.dataframe(df_gomag.head(50), use_container_width=True)
@@ -162,3 +162,40 @@ if st.session_state["drafts"]:
 
     with col3:
         st.info("Tip: Fa o importare manuala o data in Gomag ca sa salvezi maparea coloanelor; apoi automatizarea devine mai stabila.")
+
+
+# =====================
+# Debug artifacts panel
+# =====================
+st.markdown("---")
+with st.expander("Debug (download artifacts)", expanded=False):
+    dbg_dir = "debug_artifacts"
+    if os.path.isdir(dbg_dir):
+        files = sorted([f for f in os.listdir(dbg_dir) if os.path.isfile(os.path.join(dbg_dir, f))])
+        if not files:
+            st.info("Nu exista fisiere in debug_artifacts/.")
+        else:
+            st.write(f"Gasite {len(files)} fisiere in {dbg_dir}/")
+            for fn in files:
+                path = os.path.join(dbg_dir, fn)
+                try:
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                    mime = "application/octet-stream"
+                    if fn.lower().endswith(".html"):
+                        mime = "text/html"
+                    elif fn.lower().endswith(".png"):
+                        mime = "image/png"
+                    elif fn.lower().endswith(".txt"):
+                        mime = "text/plain"
+                    st.download_button(
+                        label=f"Download {fn}",
+                        data=data,
+                        file_name=fn,
+                        mime=mime,
+                        key=f"dl_{fn}",
+                    )
+                except Exception as e:
+                    st.error(f"Nu pot citi {fn}: {e}")
+    else:
+        st.info("Folderul debug_artifacts/ nu exista (inca). Ruleaza o data importul ca sa se genereze fisiere.")
