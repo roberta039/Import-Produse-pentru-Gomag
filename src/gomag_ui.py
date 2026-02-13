@@ -122,30 +122,45 @@ def _parse_categories_from_html(html: str) -> List[str]:
 
     cats: List[str] = []
 
-    # 1) tabel - prima coloana
+    # 1) tabel - prima coloana (doar randuri reale)
     rows = soup.select("table tbody tr")
     for tr in rows:
         tds = tr.find_all("td")
         if not tds:
             continue
+
         name = tds[0].get_text(" ", strip=True).replace("\u00a0", " ").strip()
         name = name.split("ID:")[0].strip()
-        if name:
-            cats.append(name)
+
+        if not name:
+            continue
+        low = name.lower()
+
+        # filtre UI / zgomot
+        if low in {"categorie", "categorii", "actiuni", "acțiuni", "nume", "name"}:
+            continue
+        if len(name) < 2 or len(name) > 80:
+            continue
+
+        cats.append(name)
 
     cats = _dedupe_keep_order(cats)
     if cats:
         return cats
 
-    # 2) fallback: link-uri care par a fi categorii
+    # 2) fallback: link-uri care par a fi categorii (daca nu exista tabel)
     for a in soup.select('a[href*="/gomag/product/category"]'):
         txt = a.get_text(" ", strip=True)
-        if txt and len(txt) < 80:
-            cats.append(txt)
+        if not txt:
+            continue
+        low = txt.lower()
+        if low in {"categorie", "categorii", "actiuni", "acțiuni", "nume", "name"}:
+            continue
+        if len(txt) < 2 or len(txt) > 80:
+            continue
+        cats.append(txt)
 
     return _dedupe_keep_order(cats)
-
-
 # ============================================================
 # Gomag UI API (folosit de app.py)
 # ============================================================
