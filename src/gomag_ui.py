@@ -247,15 +247,14 @@ def fetch_categories(creds: GomagCreds) -> List[str]:
 
 
 async def import_file_async(creds: GomagCreds, file_path: str) -> str:
-    """Uploads file on /gomag/product/import/add, validates that Gomag shows the filename,
-    then clicks Start Import and verifies that a new row appears in the import list.
+    """Uploads file, clicks Start Import, then reads the newest import row status.
+    If status indicates errors, opens the import details page and extracts first errors.
     """
     cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
 
     base = creds.base_url.rstrip("/")
     add_url = base + cfg["gomag"]["import"]["url_path"]
-
     list_url = base + "/gomag/product/import/list"
 
     async with async_playwright() as p:
@@ -263,34 +262,20 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
         try:
             await _login(page, creds, cfg)
 
-            # Capture the current newest import timestamp/snippet BEFORE we start
-            before_snip = ""
+            # Snapshot first row before
+            before_first = ""
             try:
                 await _goto_with_fallback(page, list_url)
                 await _wait_render(page, 1200)
-                before_snip = (await page.locator("table tbody tr").first.inner_text(timeout=4000)).strip()
+                before_first = (await page.locator("table tbody tr").first.inner_text(timeout=6000)).strip()
             except Exception:
-                before_snip = ""
+                before_first = ""
 
-            # Go to add page
+            # Add page
             await _goto_with_fallback(page, add_url)
             await _wait_render(page, 1400)
 
-            # Ensure import type dropdown has a value (best effort)
-            try:
-                sel = page.locator("select").first
-                if await sel.count() > 0:
-                    # if it contains 'documenteaza produse', select it
-                    opts = await sel.locator("option").all_text_contents()
-                    for o in opts:
-                        if "documenteaza" in (o or "").lower() and "produs" in (o or "").lower():
-                            await sel.select_option(label=o)
-                            break
-            except Exception:
-                pass
-
-            # Upload strictly to file input(s)
-            # Make all file inputs visible and set files
+            # Make file inputs visible
             try:
                 await page.evaluate("""() => {
                     document.querySelectorAll('input[type=file]').forEach(el => {
@@ -306,9 +291,8 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             file_inputs = page.locator('input[type="file"]')
             n = await file_inputs.count()
             if n == 0:
-                raise RuntimeError("Nu exista input[type=file] pe pagina /import/add (uploader custom).")
+                raise RuntimeError("Nu exista input[type=file] pe pagina /import/add (uploader custom / iframe).")
 
-            # Try each file input until one accepts the file
             uploaded = False
             for i in range(n):
                 try:
@@ -317,44 +301,38 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
                     break
                 except Exception:
                     continue
-
             if not uploaded:
                 raise RuntimeError("Nu am putut incarca fisierul pe niciun input[type=file].")
 
-            await _wait_render(page, 1200)
+            await _wait_render(page, 1400)
 
-            # Validate that the filename is shown somewhere on the page OR that input has a file
+            # Confirm attachment
             fname = os.path.basename(file_path)
-            has_name = False
+            attached = False
             try:
                 if await page.locator(f'text="{fname}"').count() > 0:
-                    has_name = True
+                    attached = True
             except Exception:
                 pass
-            if not has_name:
-                # check via JS if first file input has files
+            if not attached:
                 try:
-                    has_files = await page.evaluate("""() => {
+                    attached = bool(await page.evaluate("""() => {
                         const el = document.querySelector('input[type=file]');
                         return !!(el && el.files && el.files.length);
-                    }""")
-                    has_name = bool(has_files)
+                    }"""))
                 except Exception:
-                    has_name = False
-
-            if not has_name:
-                # Save debug and abort: start import would do nothing if file isn't attached
+                    attached = False
+            if not attached:
                 try:
                     os.makedirs("debug_artifacts", exist_ok=True)
                     await page.screenshot(path="debug_artifacts/gomag_upload_not_attached.png", full_page=True)
-                    html = await page.content()
                     with open("debug_artifacts/gomag_upload_not_attached.html", "w", encoding="utf-8") as f:
-                        f.write(html)
+                        f.write(await page.content())
                 except Exception:
                     pass
-                raise RuntimeError("Fisierul nu pare atasat (nu apare numele fisierului si input.files e gol).")
+                raise RuntimeError("Fisierul nu pare atasat (nu apare numele fisierului / input.files e gol).")
 
-            # Unmap VAT fields (avoid parent/variant mismatch)
+            # Unmap TVA fields
             try:
                 await page.evaluate("""() => {
                     const targets = ['Pretul Include TVA', 'Prețul Include TVA', 'Cota TVA'];
@@ -374,58 +352,82 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             except Exception:
                 pass
 
-            # Scroll top and click Start Import, then wait for network or navigation
+            # Click Start Import
             try:
                 await page.evaluate("window.scrollTo(0, 0)")
                 await page.wait_for_timeout(300)
             except Exception:
                 pass
 
-            # Click Start Import and wait a bit for Gomag to register it
-            clicked = False
-            try:
-                btn = page.locator('button:has-text("Start Import"), a:has-text("Start Import"), [role="button"]:has-text("Start Import")').first
-                if await btn.count() > 0:
-                    await btn.click(timeout=8000, force=True)
-                    clicked = True
-            except Exception:
-                clicked = False
-            if not clicked:
-                raise RuntimeError("Nu pot apasa 'Start Import' (nu gasesc butonul).")
+            btn = page.locator('button:has-text("Start Import"), a:has-text("Start Import"), [role="button"]:has-text("Start Import")').first
+            if await btn.count() == 0:
+                raise RuntimeError("Nu gasesc butonul 'Start Import'.")
+            await btn.click(timeout=10000, force=True)
 
-            # Wait up to 20s for some request activity
-            try:
-                await page.wait_for_load_state("networkidle", timeout=20000)
-            except Exception:
-                pass
+            # Wait a bit so Gomag registers import
+            await page.wait_for_timeout(2500)
 
-            # Go to import list and verify a NEW first row vs before_snip
+            # Go to list and find newest row (first row) - must differ from before
             await _goto_with_fallback(page, list_url)
             await _wait_render(page, 1400)
 
-            new_snip = ""
+            row = page.locator("table tbody tr").first
             try:
-                new_snip = (await page.locator("table tbody tr").first.inner_text(timeout=8000)).strip()
+                await row.wait_for(state="visible", timeout=15000)
             except Exception:
-                new_snip = ""
+                pass
 
-            if before_snip and new_snip and new_snip == before_snip:
-                # No new entry created -> Start Import likely didn't register
+            first_text = ""
+            try:
+                first_text = (await row.inner_text(timeout=8000)).strip()
+            except Exception:
+                first_text = ""
+
+            if before_first and first_text and first_text == before_first:
+                return "Start Import apasat, dar nu a aparut un import nou in lista."
+
+            # Extract status cell if possible (often last td)
+            status_txt = ""
+            try:
+                tds = row.locator("td")
+                td_count = await tds.count()
+                if td_count > 0:
+                    status_txt = (await tds.nth(td_count - 1).inner_text()).strip()
+            except Exception:
+                status_txt = ""
+
+            # If errors, open details by clicking file name link in first cell
+            if ("erori" in (status_txt or "").lower()) or ("erori" in (first_text or "").lower()):
                 try:
-                    os.makedirs("debug_artifacts", exist_ok=True)
-                    await page.screenshot(path="debug_artifacts/gomag_no_new_import.png", full_page=True)
-                    html = await page.content()
-                    with open("debug_artifacts/gomag_no_new_import.html", "w", encoding="utf-8") as f:
-                        f.write(html)
+                    link = row.locator("td a").first
+                    if await link.count() > 0:
+                        await link.click(timeout=10000)
+                        await _wait_render(page, 1400)
+
+                        # Find error table and return first few rows
+                        if await page.locator("text=Erori Import").count() > 0:
+                            errs = []
+                            erows = page.locator("table tbody tr")
+                            nerr = await erows.count()
+                            for i in range(min(nerr, 10)):
+                                t = await erows.nth(i).inner_text()
+                                errs.append(re.sub(r"\s+", " ", t).strip())
+                            return "Finalizat cu erori. Primele erori:\n- " + "\n- ".join(errs)
                 except Exception:
                     pass
-                return (
-                    "Start Import apasat, dar NU a aparut un import nou in lista. "
-                    "Cel mai probabil fisierul nu a fost atasat pe uploaderul corect sau Gomag a blocat actiunea. "
-                    "Am salvat debug_artifacts/gomag_no_new_import.*"
-                )
 
-            return f"OK: import nou detectat in lista. Primul rand: {new_snip[:180]}"
+                # Could not open details; save artifacts
+                try:
+                    os.makedirs("debug_artifacts", exist_ok=True)
+                    await page.screenshot(path="debug_artifacts/gomag_import_errors_list.png", full_page=True)
+                    with open("debug_artifacts/gomag_import_errors_list.html", "w", encoding="utf-8") as f:
+                        f.write(await page.content())
+                except Exception:
+                    pass
+                return f"Finalizat cu erori, dar nu am putut extrage lista. Status='{status_txt}'. Primul rand='{first_text[:180]}'"
+
+            return f"OK: import nou detectat. Status='{status_txt}'. Primul rand: {first_text[:180]}"
+
         finally:
             await context.close()
             await browser.close()
