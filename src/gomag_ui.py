@@ -258,43 +258,116 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             await _login(page, creds, cfg)
 
             await _goto_with_fallback(page, url)
+            await _wait_render(page, 1400)
+
+            # Upload (input selector from config OR FileChooser click selector if set)
+            uploaded_note = ""
+            file_sel = cfg.get("gomag", {}).get("import", {}).get("file_input_selector")
+            chooser_click = cfg.get("gomag", {}).get("import", {}).get("file_chooser_click_selector")
+
+            if file_sel:
+                try:
+                    await page.set_input_files(file_sel, file_path, timeout=60000)
+                    uploaded_note = f"input:{file_sel}"
+                except Exception:
+                    uploaded_note = ""
+
+            if not uploaded_note and chooser_click:
+                try:
+                    loc = page.locator(chooser_click).first
+                    async with page.expect_file_chooser(timeout=20000) as fc_info:
+                        await loc.click(timeout=8000)
+                    fc = await fc_info.value
+                    await fc.set_files(file_path)
+                    uploaded_note = f"filechooser:{chooser_click}"
+                except Exception:
+                    uploaded_note = ""
+
+            if not uploaded_note:
+                # last resort: generic search (if helpers exist in your file)
+                try:
+                    uploaded_note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)  # type: ignore[name-defined]
+                except Exception:
+                    uploaded_note = ""
+
+            if not uploaded_note:
+                raise RuntimeError("Nu am reusit sa incarc fisierul (nici input selector, nici filechooser).")
+
+            # Wait for mapping section or Start Import button to appear
+            try:
+                await page.wait_for_selector('text="Alege Semnificatia" , text="Alege Semnificația" , text="Start Import"', timeout=45000)
+            except Exception:
+                pass
             await _wait_render(page, 1200)
 
-            # upload (input selector from config)
-            await page.set_input_files(cfg["gomag"]["import"]["file_input_selector"], file_path)
-            await _wait_render(page, 1200)
-
-            # === Import wizard: mapping page ===
-            # Ensure "Coreleaza automat..." is enabled if present
+            # Ensure automatic mapping checkbox is ON if present
             try:
                 auto_lbl = page.get_by_text("Coreleaza automat", exact=False).first
                 if await auto_lbl.count() > 0:
+                    # click label to ensure checked
                     await auto_lbl.click(timeout=2000)
             except Exception:
                 pass
 
-            # Click the visible "Start Import" button (top-right) if present
+            # Scroll to top (Start Import is top-right)
             try:
-                start_btn = page.get_by_role("button", name=re.compile(r"Start\s+Import", re.I)).first
-                if await start_btn.count() == 0:
-                    start_btn = page.locator('button:has-text("Start Import")').first
-                if await start_btn.count() > 0 and await start_btn.is_enabled():
-                    await start_btn.click(timeout=7000)
-                    await page.wait_for_timeout(2000)
-                    return "Import pornit (Start Import apasat)."
+                await page.evaluate("window.scrollTo(0, 0)")
+                await page.wait_for_timeout(400)
             except Exception:
                 pass
 
-            # Fallback: config selector (older implementations)
+            # Robust click Start Import (button OR link styled button)
+            start_selectors = [
+                'button:has-text("Start Import")',
+                'a:has-text("Start Import")',
+                'input[type="submit"][value*="Start" i]',
+                '[role="button"]:has-text("Start Import")',
+                'text=Start Import',
+            ]
+
+            clicked = False
+            last_click_err = None
+            for sel in start_selectors:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count() == 0:
+                        continue
+                    await loc.scroll_into_view_if_needed(timeout=5000)
+                    await loc.wait_for(state="visible", timeout=15000)
+                    try:
+                        await loc.click(timeout=8000, force=True)
+                    except Exception:
+                        # JS click fallback
+                        try:
+                            await page.evaluate("(el) => el.click()", await loc.element_handle())
+                        except Exception as ee:
+                            raise ee
+                    clicked = True
+                    break
+                except Exception as e:
+                    last_click_err = e
+                    continue
+
+            if clicked:
+                await _wait_render(page, 2000)
+                return f"Import pornit (Start Import apasat). Upload={uploaded_note}"
+
+            # Debug artifacts to see why button wasn't clickable/visible
             try:
-                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=7000)
-                await page.wait_for_timeout(2000)
-                return "Import pornit (selector din config)."
+                os.makedirs("debug_artifacts", exist_ok=True)
+                await page.screenshot(path="debug_artifacts/gomag_after_upload.png", full_page=True)
+                html = await page.content()
+                with open("debug_artifacts/gomag_after_upload.html", "w", encoding="utf-8") as f:
+                    f.write(html)
             except Exception:
-                return (
-                    "Am incarcat fisierul, dar nu am putut porni importul automat "
-                    "(probabil e nevoie de mapare/confirmare manuala in Gomag: apasa butonul 'Start Import')."
-                )
+                pass
+
+            return (
+                "Am incarcat fisierul, dar nu am putut porni importul automat. "
+                f"Upload={uploaded_note}. "
+                f"Ultima eroare click: {last_click_err}. "
+                "Am salvat debug_artifacts/gomag_after_upload.png si .html."
+            )
         finally:
             await context.close()
             await browser.close()
