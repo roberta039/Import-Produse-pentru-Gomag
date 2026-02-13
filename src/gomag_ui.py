@@ -6,13 +6,16 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
 
+import yaml
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
 
-# ========= Playwright runtime install + SSL/TLS workaround (Streamlit Cloud) =========
+# ============================================================
+# Playwright runtime install + SSL/TLS workaround (Streamlit Cloud)
+# ============================================================
 
 def _pw_writable_browsers_path() -> str:
     home = os.path.expanduser("~")
@@ -20,7 +23,10 @@ def _pw_writable_browsers_path() -> str:
 
 
 def _ensure_playwright_chromium_installed() -> None:
-    """Ensure Playwright Chromium exists. Safe for Streamlit Cloud."""
+    """
+    Ensure Playwright Chromium exists. Safe for Streamlit Cloud.
+    Installs into a writable path: ~/.cache/ms-playwright
+    """
     if os.environ.get("PW_CHROMIUM_READY") == "1":
         return
 
@@ -67,17 +73,23 @@ async def _launch_ctx(p):
 
 
 async def _goto_with_fallback(page, url: str):
+    """
+    Fix pentru ERR_SSL_PROTOCOL_ERROR:
+    - încearcă https
+    - dacă pică handshake-ul, încearcă http
+    """
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        return
     except Exception:
         if url.startswith("https://"):
             await page.goto("http://" + url[len("https://"):], wait_until="domcontentloaded", timeout=60000)
-        else:
-            raise
+            return
+        raise
 
 
 async def _wait_render(page, extra_ms: int = 800):
-    # Networkidle is often best for dashboards with XHR
+    # Pentru pagini cu XHR: networkidle e mai robust
     try:
         await page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
@@ -85,75 +97,32 @@ async def _wait_render(page, extra_ms: int = 800):
     await page.wait_for_timeout(extra_ms)
 
 
-# ========= Gomag helpers =========
-
-@dataclass
-class GomagCreds:
-    base_url: str
-    username: str
-    password: str
-
-
-def _dashboard_url(base: str) -> str:
-    return base.rstrip("/") + "/gomag/dashboard"
-
-
-def _categories_url(base: str) -> str:
-    # user confirmed
-    return base.rstrip("/") + "/gomag/product/category/list"
-
-
 def _looks_like_login(html: str) -> bool:
-    s = html.lower()
-    return ("type=\"password\"" in s) and ("login" in s or "autent" in s)
-
-
-async def _login(page, creds: GomagCreds):
-    await _goto_with_fallback(page, _dashboard_url(creds.base_url))
-    await _wait_render(page, 600)
-
-    # Fill login form (generic selectors)
-    await page.fill(
-        'input[type="email"], input[name*="email" i], input[id*="email" i], input[name*="user" i], input[placeholder*="email" i], input[placeholder*="user" i]',
-        creds.username,
-    )
-    await page.fill(
-        'input[type="password"], input[name*="pass" i], input[id*="pass" i], input[placeholder*="parol" i], input[placeholder*="pass" i]',
-        creds.password,
-    )
-
-    # Submit
-    try:
-        await page.click(
-            'button[type="submit"], input[type="submit"], button:has-text("Login"), button:has-text("Autentificare")',
-            timeout=8000,
-        )
-    except Exception:
-        await page.keyboard.press("Enter")
-
-    await _wait_render(page, 1400)
+    s = (html or "").lower()
+    return ("type=\"password\"" in s) and ("login" in s or "autent" in s or "parol" in s)
 
 
 def _dedupe_keep_order(items: List[str]) -> List[str]:
     seen = set()
     out = []
     for x in items:
-        x = re.sub(r"\s+", " ", x).strip()
+        x = re.sub(r"\s+", " ", (x or "").strip())
         if not x:
             continue
-        if x.lower() in seen:
+        key = x.lower()
+        if key in seen:
             continue
-        seen.add(x.lower())
+        seen.add(key)
         out.append(x)
     return out
 
 
-def _parse_categories_from_html(html: str) -> Tuple[List[str], str]:
-    soup = BeautifulSoup(html, "lxml")
+def _parse_categories_from_html(html: str) -> List[str]:
+    soup = BeautifulSoup(html or "", "lxml")
 
     cats: List[str] = []
 
-    # 1) Preferred: table first column
+    # 1) tabel - prima coloana
     rows = soup.select("table tbody tr")
     for tr in rows:
         tds = tr.find_all("td")
@@ -164,62 +133,108 @@ def _parse_categories_from_html(html: str) -> Tuple[List[str], str]:
         if name:
             cats.append(name)
 
+    cats = _dedupe_keep_order(cats)
     if cats:
-        return _dedupe_keep_order(cats), "table"
+        return cats
 
-    # 2) Fallback: links that look like category edit/view inside gomag
+    # 2) fallback: link-uri care par a fi categorii
     for a in soup.select('a[href*="/gomag/product/category"]'):
         txt = a.get_text(" ", strip=True)
         if txt and len(txt) < 80:
             cats.append(txt)
 
-    if cats:
-        return _dedupe_keep_order(cats), "links"
+    return _dedupe_keep_order(cats)
 
-    # 3) Fallback: any strong/bold in list
-    for el in soup.select("strong, b"):
-        txt = el.get_text(" ", strip=True)
-        if txt and len(txt) < 80:
-            cats.append(txt)
 
-    return _dedupe_keep_order(cats), "fallback"
+# ============================================================
+# Gomag UI API (folosit de app.py)
+# ============================================================
+
+@dataclass
+class GomagCreds:
+    base_url: str
+    dashboard_path: str
+    username: str
+    password: str
+
+
+def _load_cfg():
+    with open("config.yaml", "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+async def _login(page, creds: GomagCreds, cfg):
+    login_url = creds.base_url.rstrip("/") + (creds.dashboard_path or "/gomag/dashboard")
+    await _goto_with_fallback(page, login_url)
+    await _wait_render(page, 600)
+
+    # selectori din config.yaml (compatibil cu versiunea ta)
+    await page.fill(cfg["gomag"]["login"]["username_selector"], creds.username)
+    await page.fill(cfg["gomag"]["login"]["password_selector"], creds.password)
+    await page.click(cfg["gomag"]["login"]["submit_selector"])
+
+    await _wait_render(page, int(cfg["gomag"]["login"].get("post_login_wait", 2.0) * 1000))
 
 
 async def fetch_categories_async(creds: GomagCreds) -> List[str]:
+    cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
+
+    # IMPORTANT: user a confirmat URL-ul corect:
+    # /gomag/product/category/list
+    url_path = cfg.get("gomag", {}).get("categories", {}).get("url_path") or "/gomag/product/category/list"
+    url = creds.base_url.rstrip("/") + url_path
 
     async with async_playwright() as p:
         browser, context, page = await _launch_ctx(p)
         try:
-            await _login(page, creds)
+            await _login(page, creds, cfg)
 
-            url = _categories_url(creds.base_url)
             await _goto_with_fallback(page, url)
             await _wait_render(page, 1200)
 
-            # Try to wait for either table rows or something that indicates list loaded
-            try:
-                await page.wait_for_selector("table tbody tr, a[href*='/gomag/product/category']", timeout=20000)
-            except Exception:
-                pass
-
-            await _wait_render(page, 800)
-            html = await page.content()
-
-            # Detect login redirect (common reason for 0 cats)
-            if _looks_like_login(html):
-                raise RuntimeError("Login Gomag a esuat sau sesiunea nu s-a pastrat (am ajuns inapoi la pagina de login).")
-
-            cats, method = _parse_categories_from_html(html)
-            if not cats:
-                # write debug artifact to help if still needed
-                dbg = os.path.join("/tmp", "gomag_categories_debug.html")
+            # 1) încearcă selectorul din config (dacă există)
+            cats: List[str] = []
+            item_selector = cfg.get("gomag", {}).get("categories", {}).get("item_selector")
+            if item_selector:
                 try:
-                    with open(dbg, "w", encoding="utf-8") as f:
-                        f.write(html)
+                    await page.wait_for_selector(item_selector, timeout=15000)
                 except Exception:
                     pass
-                raise RuntimeError("Nu am putut extrage categoriile (pagina s-a incarcat, dar nu am gasit tabelul/link-urile).")
+                try:
+                    items = await page.query_selector_all(item_selector)
+                    for it in items:
+                        try:
+                            txt = (await it.inner_text()).strip()
+                            if txt:
+                                cats.append(txt)
+                        except Exception:
+                            continue
+                    cats = _dedupe_keep_order(cats)
+                except Exception:
+                    cats = []
+
+            # 2) dacă selectorul nu a produs nimic, parsează HTML (tabel/link-uri)
+            if not cats:
+                # așteaptă orice indicator de listă: tabel sau link-uri de categorie
+                try:
+                    await page.wait_for_selector("table tbody tr, a[href*='/gomag/product/category']", timeout=20000)
+                except Exception:
+                    pass
+                await _wait_render(page, 800)
+                html = await page.content()
+
+                if _looks_like_login(html):
+                    raise RuntimeError(
+                        "Login Gomag a esuat sau sesiunea nu s-a pastrat (am ajuns inapoi la pagina de login)."
+                    )
+
+                cats = _parse_categories_from_html(html)
+
+            if not cats:
+                raise RuntimeError(
+                    "Nu am putut extrage categoriile (pagina s-a incarcat, dar nu am gasit tabelul/link-urile)."
+                )
 
             return cats
         finally:
@@ -231,6 +246,38 @@ def fetch_categories(creds: GomagCreds) -> List[str]:
     return asyncio.run(fetch_categories_async(creds))
 
 
-# import_file should remain in your repo; app.py imports it from here.
-# If your existing repo already has import_file/import_file_async implemented in this module,
-# keep them below unchanged. This patch only modifies category loading robustness.
+async def import_file_async(creds: GomagCreds, file_path: str) -> str:
+    cfg = _load_cfg()
+    _ensure_playwright_chromium_installed()
+
+    url = creds.base_url.rstrip("/") + cfg["gomag"]["import"]["url_path"]
+
+    async with async_playwright() as p:
+        browser, context, page = await _launch_ctx(p)
+        try:
+            await _login(page, creds, cfg)
+
+            await _goto_with_fallback(page, url)
+            await _wait_render(page, 1000)
+
+            # upload
+            await page.set_input_files(cfg["gomag"]["import"]["file_input_selector"], file_path)
+
+            # attempt start
+            try:
+                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=5000)
+            except Exception:
+                return (
+                    "Am incarcat fisierul, dar nu am putut porni importul automat "
+                    "(probabil e nevoie de mapare coloane manual la prima rulare)."
+                )
+
+            await page.wait_for_timeout(2000)
+            return "Import pornit (daca Gomag nu a cerut pasi suplimentari)."
+        finally:
+            await context.close()
+            await browser.close()
+
+
+def import_file(creds: GomagCreds, file_path: str) -> str:
+    return asyncio.run(import_file_async(creds, file_path))
