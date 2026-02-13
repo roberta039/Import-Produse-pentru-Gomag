@@ -246,91 +246,116 @@ def fetch_categories(creds: GomagCreds) -> List[str]:
     return asyncio.run(fetch_categories_async(creds))
 
 
-async def _upload_via_filechooser(page, file_path: str, click_selectors: list[str], timeout_ms: int = 20000) -> str:
-    """Fallback pentru upload când NU există <input type=file> în DOM.
-    Apasă un buton care deschide dialogul de fișier și setează fișierul prin FileChooser.
-    """
-    last_err = None
-    for sel in click_selectors:
-        try:
-            loc = page.locator(sel).first
-            if await loc.count() == 0:
-                continue
-            async with page.expect_file_chooser(timeout=timeout_ms) as fc_info:
-                await loc.click(timeout=3000)
-            fc = await fc_info.value
-            await fc.set_files(file_path)
-            return f"filechooser:{sel}"
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"Nu am reusit upload prin FileChooser (niciun buton nu a deschis dialogul). Last: {last_err}")
+async def _try_expect_filechooser_click(locator, file_path: str, timeout_ms: int = 8000) -> bool:
+    """Click locator and, if it opens a file chooser, set file and return True."""
+    try:
+        async with locator.page.expect_file_chooser(timeout=timeout_ms) as fc_info:
+            await locator.click(timeout=timeout_ms)
+        fc = await fc_info.value
+        await fc.set_files(file_path)
+        return True
+    except Exception:
+        return False
 
 
-async def _set_input_files_anywhere(page, file_path: str, timeout_ms: int = 60000) -> str:
-    """Cauta un input[type=file] pe pagina sau in iframe-uri si face upload.
-    Returneaza un mesaj scurt cu unde a reusit.
+async def _upload_via_filechooser_sweep(page, file_path: str) -> str:
+    """Fallback când NU există <input type=file> în DOM.
+    În Gomag uneori uploaderul e un buton/dropzone care deschide dialog nativ.
+    Facem un 'sweep' pe texte + clase uzuale + elemente clickabile.
     """
-    candidates = [
-        'input[type="file"]',
-        'input[type="file"][name]',
-        'input[type="file"][accept]',
-        'input[accept*="csv" i]',
-        'input[accept*="xls" i]',
-        'input[accept*="xlsx" i]',
+    # Ensure UI is rendered
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(800)
+
+    # 1) Try by visible texts (Romanian/English)
+    texts = [
+        "Alege fisier", "Alege fișier",
+        "Selecteaza fisier", "Selectează fișier",
+        "Incarca fisier", "Încarcă fișier", "Incarca", "Încarcă",
+        "Upload", "Choose file", "Browse",
+        "Import", "Importa", "Importă",
+        "Fisiere", "Fișiere",
     ]
+    for t in texts:
+        loc = page.get_by_text(t, exact=False).first
+        if await loc.count() > 0:
+            ok = await _try_expect_filechooser_click(loc, file_path, timeout_ms=7000)
+            if ok:
+                return f"filechooser:text:{t}"
 
-    # Main page
-    for sel in candidates:
+    # 2) Try common uploader/dropzone classes & buttons
+    selectors = [
+        "button", "a", "label",
+        ".btn", ".button", ".upload", ".uploader", ".import",
+        ".dropzone", ".dz-clickable", ".dz-message",
+        ".qq-upload-button", ".fine-uploader", ".qq-upload-drop-area",
+        "[class*='upload' i]", "[id*='upload' i]",
+        "[class*='import' i]", "[id*='import' i]",
+        "[class*='file' i]", "[id*='file' i]",
+    ]
+    for sel in selectors:
         try:
-            loc = page.locator(sel).first
-            await loc.wait_for(state="attached", timeout=timeout_ms // 3)
-            # unhide just in case
-            try:
-                await page.evaluate(
-                    """(sel) => {
-                        const el = document.querySelector(sel);
-                        if (!el) return;
-                        el.style.display = 'block';
-                        el.style.visibility = 'visible';
-                        el.style.opacity = 1;
-                        el.removeAttribute('hidden');
-                    }""", sel
-                )
-            except Exception:
-                pass
-            await loc.set_input_files(file_path, timeout=timeout_ms // 3)
-            return f"main:{sel}"
+            # only a handful (avoid clicking whole page)
+            locs = page.locator(sel)
+            n = await locs.count()
+            for i in range(min(n, 20)):
+                loc = locs.nth(i)
+                # skip invisible
+                try:
+                    if not await loc.is_visible():
+                        continue
+                except Exception:
+                    continue
+                ok = await _try_expect_filechooser_click(loc, file_path, timeout_ms=4000)
+                if ok:
+                    return f"filechooser:sel:{sel}[{i}]"
         except Exception:
             continue
 
-    # Iframes
-    for fr in page.frames:
-        if fr == page.main_frame:
-            continue
-        for sel in candidates:
+    # 3) Last resort: click center of the largest visible "dropzone-like" div
+    try:
+        # find candidates in DOM with keywords in class/id
+        handle = await page.evaluate_handle("""() => {
+            const els = Array.from(document.querySelectorAll('div,section,main'));
+            const cand = els
+              .filter(e => {
+                const s = ((e.id||'') + ' ' + (e.className||'')).toLowerCase();
+                return s.includes('drop') || s.includes('upload') || s.includes('import') || s.includes('file');
+              })
+              .filter(e => e.offsetWidth > 200 && e.offsetHeight > 80)
+              .sort((a,b) => (b.offsetWidth*b.offsetHeight) - (a.offsetWidth*a.offsetHeight))[0];
+            return cand || null;
+        }""")
+        if handle:
+            loc = page.locator(":is(div,section,main)").filter(has=page.locator("text=Upload")).first  # harmless
+            # click the element via JS to trigger file chooser if bound
             try:
-                loc = fr.locator(sel).first
-                await loc.wait_for(state="attached", timeout=timeout_ms // 3)
-                try:
-                    await fr.evaluate(
-                        """(sel) => {
-                            const el = document.querySelector(sel);
-                            if (!el) return;
-                            el.style.display = 'block';
-                            el.style.visibility = 'visible';
-                            el.style.opacity = 1;
-                            el.removeAttribute('hidden');
-                        }""", sel
-                    )
-                except Exception:
-                    pass
-                await loc.set_input_files(file_path, timeout=timeout_ms // 3)
-                return f"frame:{sel}"
+                async with page.expect_file_chooser(timeout=8000) as fc_info:
+                    await page.evaluate("""(el) => el.click()""", handle)
+                fc = await fc_info.value
+                await fc.set_files(file_path)
+                return "filechooser:js_click:dropzone"
             except Exception:
-                continue
+                pass
+    except Exception:
+        pass
 
-    raise RuntimeError("Nu am gasit niciun <input type=file> pe pagina (nici in iframe-uri).")
+    # Debug artifacts (help in Streamlit Cloud logs)
+    try:
+        await page.screenshot(path="/tmp/gomag_import_debug.png", full_page=True)
+        html = await page.content()
+        with open("/tmp/gomag_import_debug.html", "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Nu am reusit upload: nu exista <input type=file> si niciun buton/dropzone nu a deschis FileChooser. "
+        "Am salvat /tmp/gomag_import_debug.png si /tmp/gomag_import_debug.html (daca platforma permite)."
+    )
 
 
 async def import_file_async(creds: GomagCreds, file_path: str) -> str:
@@ -347,33 +372,7 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             await _goto_with_fallback(page, url)
             await _wait_render(page, 1600)
 
-            # Butoane uzuale care pot deschide uploaderul / file chooser
-            click_selectors = []
-            # daca ai in config un selector de click explicit
-            if cfg.get("gomag", {}).get("import", {}).get("file_chooser_click_selector"):
-                click_selectors.append(cfg["gomag"]["import"]["file_chooser_click_selector"])
-            if cfg.get("gomag", {}).get("import", {}).get("open_import_selector"):
-                click_selectors.append(cfg["gomag"]["import"]["open_import_selector"])
-
-            click_selectors += [
-                'button:has-text("Alege fisier")',
-                'button:has-text("Alege fișier")',
-                'button:has-text("Selecteaza fisier")',
-                'button:has-text("Selectează fișier")',
-                'button:has-text("Browse")',
-                'button:has-text("Choose file")',
-                'button:has-text("Upload")',
-                'button:has-text("Încarcă")',
-                'button:has-text("Incarca")',
-                'a:has-text("Import")',
-                'button:has-text("Import")',
-                # common uploader libs
-                '.qq-upload-button',
-                '.fine-uploader button',
-                '.uploader button',
-            ]
-
-            # 1) încearcă selectorul de input din config / apoi orice input din DOM
+            # 1) try config file input (if any)
             note = ""
             file_sel = cfg.get("gomag", {}).get("import", {}).get("file_input_selector")
             if file_sel:
@@ -383,25 +382,23 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
                     await loc.set_input_files(file_path, timeout=30000)
                     note = f"cfg:{file_sel}"
                 except Exception:
-                    # fallback generic input search
-                    try:
-                        note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)
-                    except Exception:
-                        note = ""
+                    note = ""
 
-            else:
+            # 2) try generic input search (main + iframes) - if helper exists in your file, keep it;
+            # if not, we fall back to FileChooser sweep directly.
+            if not note and "async def _set_input_files_anywhere" in globals():
                 try:
-                    note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)
+                    note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)  # type: ignore[name-defined]
                 except Exception:
                     note = ""
 
-            # 2) dacă nu există input deloc, încearcă FileChooser (dialogul nativ)
+            # 3) FileChooser sweep (no <input type=file>)
             if not note:
-                note = await _upload_via_filechooser(page, file_path, click_selectors, timeout_ms=25000)
+                note = await _upload_via_filechooser_sweep(page, file_path)
 
             await _wait_render(page, 1200)
 
-            # 3) Start import (dacă există)
+            # Start import (if exists)
             try:
                 await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=7000)
                 await page.wait_for_timeout(1500)
