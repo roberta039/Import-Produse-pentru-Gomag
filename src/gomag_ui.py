@@ -246,6 +246,27 @@ def fetch_categories(creds: GomagCreds) -> List[str]:
     return asyncio.run(fetch_categories_async(creds))
 
 
+async def _upload_via_filechooser(page, file_path: str, click_selectors: list[str], timeout_ms: int = 20000) -> str:
+    """Fallback pentru upload când NU există <input type=file> în DOM.
+    Apasă un buton care deschide dialogul de fișier și setează fișierul prin FileChooser.
+    """
+    last_err = None
+    for sel in click_selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() == 0:
+                continue
+            async with page.expect_file_chooser(timeout=timeout_ms) as fc_info:
+                await loc.click(timeout=3000)
+            fc = await fc_info.value
+            await fc.set_files(file_path)
+            return f"filechooser:{sel}"
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Nu am reusit upload prin FileChooser (niciun buton nu a deschis dialogul). Last: {last_err}")
+
+
 async def _set_input_files_anywhere(page, file_path: str, timeout_ms: int = 60000) -> str:
     """Cauta un input[type=file] pe pagina sau in iframe-uri si face upload.
     Returneaza un mesaj scurt cu unde a reusit.
@@ -324,35 +345,35 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             await _login(page, creds, cfg)
 
             await _goto_with_fallback(page, url)
-            await _wait_render(page, 1400)
+            await _wait_render(page, 1600)
 
-            # Uneori input-ul apare doar dupa click pe un buton (Upload/Import).
-            open_btn_selectors = []
+            # Butoane uzuale care pot deschide uploaderul / file chooser
+            click_selectors = []
+            # daca ai in config un selector de click explicit
+            if cfg.get("gomag", {}).get("import", {}).get("file_chooser_click_selector"):
+                click_selectors.append(cfg["gomag"]["import"]["file_chooser_click_selector"])
             if cfg.get("gomag", {}).get("import", {}).get("open_import_selector"):
-                open_btn_selectors.append(cfg["gomag"]["import"]["open_import_selector"])
+                click_selectors.append(cfg["gomag"]["import"]["open_import_selector"])
 
-            open_btn_selectors += [
-                'button:has-text("Import")',
-                'a:has-text("Import")',
+            click_selectors += [
+                'button:has-text("Alege fisier")',
+                'button:has-text("Alege fișier")',
+                'button:has-text("Selecteaza fisier")',
+                'button:has-text("Selectează fișier")',
+                'button:has-text("Browse")',
+                'button:has-text("Choose file")',
                 'button:has-text("Upload")',
-                'a:has-text("Upload")',
-                'button:has-text("Alege")',
-                'button:has-text("Selecteaza")',
                 'button:has-text("Încarcă")',
                 'button:has-text("Incarca")',
+                'a:has-text("Import")',
+                'button:has-text("Import")',
+                # common uploader libs
+                '.qq-upload-button',
+                '.fine-uploader button',
+                '.uploader button',
             ]
 
-            for sel in open_btn_selectors:
-                try:
-                    btn = page.locator(sel).first
-                    if await btn.count() > 0:
-                        await btn.click(timeout=1500)
-                        await page.wait_for_timeout(400)
-                        break
-                except Exception:
-                    continue
-
-            # Upload (config selector first, then fallback anywhere)
+            # 1) încearcă selectorul de input din config / apoi orice input din DOM
             note = ""
             file_sel = cfg.get("gomag", {}).get("import", {}).get("file_input_selector")
             if file_sel:
@@ -362,13 +383,27 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
                     await loc.set_input_files(file_path, timeout=30000)
                     note = f"cfg:{file_sel}"
                 except Exception:
-                    note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)
-            else:
-                note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)
+                    # fallback generic input search
+                    try:
+                        note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)
+                    except Exception:
+                        note = ""
 
-            # Start import (daca exista)
+            else:
+                try:
+                    note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)
+                except Exception:
+                    note = ""
+
+            # 2) dacă nu există input deloc, încearcă FileChooser (dialogul nativ)
+            if not note:
+                note = await _upload_via_filechooser(page, file_path, click_selectors, timeout_ms=25000)
+
+            await _wait_render(page, 1200)
+
+            # 3) Start import (dacă există)
             try:
-                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=5000)
+                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=7000)
                 await page.wait_for_timeout(1500)
                 return f"Fisier incarcat ({note}). Import pornit (daca Gomag nu a cerut pasi suplimentari)."
             except Exception:
