@@ -1,5 +1,46 @@
 import os
 import tempfile
+def _secret_get(path, default=None):
+    """Read secrets by trying multiple formats.
+    path can be tuple for nested keys, or string for top-level key.
+    """
+    # st.secrets nested
+    try:
+        if isinstance(path, tuple):
+            cur = st.secrets
+            for p in path:
+                if p in cur:
+                    cur = cur[p]
+                else:
+                    return default
+            return cur
+        else:
+            return st.secrets.get(path, default)
+    except Exception:
+        return default
+
+
+def _get_gomag_creds():
+    # Preferred (legacy in this project): [GOMAG] BASE_URL/USERNAME/PASSWORD
+    base_url = _secret_get(("GOMAG", "BASE_URL")) or _secret_get("GOMAG_BASE_URL") or _secret_get(("gomag", "base_url"))
+    email = _secret_get(("GOMAG", "USERNAME")) or _secret_get("GOMAG_EMAIL") or _secret_get(("gomag", "email"))
+    password = _secret_get(("GOMAG", "PASSWORD")) or _secret_get("GOMAG_PASSWORD") or _secret_get(("gomag", "password"))
+
+    # Some users used keys email/password under [GOMAG]
+    if not email:
+        email = _secret_get(("GOMAG", "EMAIL"))
+    if not password:
+        password = _secret_get(("GOMAG", "PASS")) or _secret_get(("GOMAG", "PAROLA"))
+
+    base_url = (str(base_url).strip() if base_url else "")
+    email = (str(email).strip() if email else "")
+    password = (str(password).strip() if password else "")
+
+    if not (base_url and email and password):
+        return None
+
+    # IMPORTANT: gomag_ui.py expects GomagCreds(base_url, email, password)
+    return GomagCreds(base_url=base_url, email=email, password=password)
 
 import pandas as pd
 import streamlit as st
@@ -63,16 +104,14 @@ with st.sidebar:
     st.header("Gomag")
     gomag_enabled = st.checkbox("Activeaza conectare Gomag (Playwright)", value=False)
     if gomag_enabled:
-        try:
-            base_url = st.secrets["GOMAG"]["BASE_URL"]
-            dashboard_path = st.secrets["GOMAG"].get("DASHBOARD_PATH", "/gomag/dashboard")
-            username = st.secrets["GOMAG"]["USERNAME"]
-            password = st.secrets["GOMAG"]["PASSWORD"]
-            creds = GomagCreds(base_url=base_url, dashboard_path=dashboard_path, username=username, password=password)
-            st.success("Secrets Gomag incarcate.")
-        except Exception:
-            creds = None
-            st.error("Lipsesc secrets Gomag. Completeaza in Streamlit Cloud -> Settings -> Secrets.")
+try:
+    creds = _get_gomag_creds()
+    if creds is None:
+        raise RuntimeError("missing")
+    st.success("Secrets Gomag incarcate.")
+except Exception:
+    creds = None
+    st.error("Lipsesc secrets Gomag. Completeaza in Streamlit Cloud -> Settings -> Secrets.")
     else:
         creds = None
 
