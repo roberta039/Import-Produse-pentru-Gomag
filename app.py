@@ -33,9 +33,6 @@ with st.sidebar.expander("Debug (download artifacts)", expanded=False):
                     st.error(f"Nu pot citi {fn}: {e}")
     else:
         st.info("Folderul debug_artifacts/ nu exista (inca). Ruleaza o data importul ca sa se genereze fisiere.")
-
-from __future__ import annotations
-import os
 import streamlit as st
 # --- PSI ProductFinder creds -> env (for scrapers) ---
 import os as _os
