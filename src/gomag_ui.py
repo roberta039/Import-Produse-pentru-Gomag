@@ -258,26 +258,46 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             await _login(page, creds, cfg)
 
             await _goto_with_fallback(page, url)
-            await _wait_render(page, 1000)
+            await _wait_render(page, 1200)
 
-            # upload
+            # upload (input selector from config)
             await page.set_input_files(cfg["gomag"]["import"]["file_input_selector"], file_path)
+            await _wait_render(page, 1200)
 
-            # attempt start
+            # === Import wizard: mapping page ===
+            # Ensure "Coreleaza automat..." is enabled if present
             try:
-                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=5000)
+                auto_lbl = page.get_by_text("Coreleaza automat", exact=False).first
+                if await auto_lbl.count() > 0:
+                    await auto_lbl.click(timeout=2000)
+            except Exception:
+                pass
+
+            # Click the visible "Start Import" button (top-right) if present
+            try:
+                start_btn = page.get_by_role("button", name=re.compile(r"Start\s+Import", re.I)).first
+                if await start_btn.count() == 0:
+                    start_btn = page.locator('button:has-text("Start Import")').first
+                if await start_btn.count() > 0 and await start_btn.is_enabled():
+                    await start_btn.click(timeout=7000)
+                    await page.wait_for_timeout(2000)
+                    return "Import pornit (Start Import apasat)."
+            except Exception:
+                pass
+
+            # Fallback: config selector (older implementations)
+            try:
+                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=7000)
+                await page.wait_for_timeout(2000)
+                return "Import pornit (selector din config)."
             except Exception:
                 return (
                     "Am incarcat fisierul, dar nu am putut porni importul automat "
-                    "(probabil e nevoie de mapare coloane manual la prima rulare)."
+                    "(probabil e nevoie de mapare/confirmare manuala in Gomag: apasa butonul 'Start Import')."
                 )
-
-            await page.wait_for_timeout(2000)
-            return "Import pornit (daca Gomag nu a cerut pasi suplimentari)."
         finally:
             await context.close()
             await browser.close()
-
 
 def import_file(creds: GomagCreds, file_path: str) -> str:
     return asyncio.run(import_file_async(creds, file_path))
