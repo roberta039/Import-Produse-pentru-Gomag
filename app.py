@@ -20,7 +20,7 @@ import pandas as pd
 import tempfile
 from src.utils import detect_url_column
 from src.pipeline import scrape_products
-from src.export_gomag import to_gomag_dataframe, save_xlsx
+from src.export_gomag import to_gomag_dataframe, save_tsv
 from src.gomag_ui import GomagCreds, fetch_categories, import_file
 
 st.set_page_config(page_title="Gomag Importer", layout="wide")
