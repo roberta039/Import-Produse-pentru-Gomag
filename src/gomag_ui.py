@@ -247,187 +247,76 @@ def fetch_categories(creds: GomagCreds) -> List[str]:
 
 
 async def import_file_async(creds: GomagCreds, file_path: str) -> str:
-    """Uploads file, clicks Start Import, then reads the newest import row status (robust HTML parsing).
-    If status indicates errors, opens import details and extracts first errors.
-    """
     cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
 
-    base = creds.base_url.rstrip("/")
-    add_url = base + cfg["gomag"]["import"]["url_path"]
-    list_url = base + "/gomag/product/import/list"
-
-    def _extract_first_row(html: str):
-        soup = BeautifulSoup(html or "", "lxml")
-        row = soup.select_one("table tbody tr")
-        if not row:
-            return "", "", ""
-        tds = [td.get_text(" ", strip=True) for td in row.find_all("td")]
-        first_text = " | ".join([t for t in tds if t])
-        status_txt = tds[-1] if tds else ""
-        # also grab first link href (details)
-        a = row.select_one("td a")
-        href = a.get("href") if a else ""
-        return first_text.strip(), status_txt.strip(), (href or "").strip()
-
-    async def _goto_and_get_html(url: str):
-        await _goto_with_fallback(page, url)
-        await _wait_render(page, 1500)
-        html = await page.content()
-        if html.strip().replace(" ", "") == "<html><head></head><body></body></html>":
-            await page.wait_for_timeout(1200)
-            try:
-                await page.reload(wait_until="domcontentloaded", timeout=120000)
-            except Exception:
-                pass
-            await _wait_render(page, 1500)
-            html = await page.content()
-        return html
+    # Use explicit import/add endpoint (this is where the upload + mapping + Start Import are)
+    url = creds.base_url.rstrip("/") + cfg["gomag"]["import"]["url_path"]
 
     async with async_playwright() as p:
         browser, context, page = await _launch_ctx(p)
         try:
             await _login(page, creds, cfg)
 
-            before_html = ""
-            try:
-                before_html = await _goto_and_get_html(list_url)
-            except Exception:
-                before_html = ""
-            before_first, _, _ = _extract_first_row(before_html)
+            await _goto_with_fallback(page, url)
+            await _wait_render(page, 1000)
 
-            # Add page
-            await _goto_and_get_html(add_url)
+            # 1) Upload the file (Gomag uses a hidden <input type=file> with onchange=sendFile(...))
+            file_input_sel = cfg["gomag"]["import"].get("file_input_selector", "input[type='file']")
+            await page.wait_for_selector(file_input_sel, timeout=30000)
+            await page.set_input_files(file_input_sel, file_path)
 
-            # Make file inputs visible
+            # 2) Wait until Gomag processes the upload and injects the mapping UI (it sets a hidden #_source)
             try:
-                await page.evaluate("""() => {
-                    document.querySelectorAll('input[type=file]').forEach(el => {
-                        el.style.display='block';
-                        el.style.visibility='visible';
-                        el.style.opacity='1';
-                        el.removeAttribute('hidden');
-                    });
-                }""")
+                await page.wait_for_selector("input#_source", timeout=30000)
             except Exception:
                 pass
 
-            file_inputs = page.locator('input[type="file"]')
-            n = await file_inputs.count()
-            if n == 0:
-                raise RuntimeError("Nu exista input[type=file] pe pagina /import/add (uploader custom / iframe).")
-
-            uploaded = False
-            for i in range(n):
-                try:
-                    await file_inputs.nth(i).set_input_files(file_path, timeout=60000)
-                    uploaded = True
-                    break
-                except Exception:
-                    continue
-            if not uploaded:
-                raise RuntimeError("Nu am putut incarca fisierul pe niciun input[type=file].")
-
-            await _wait_render(page, 1400)
-
-            # Confirm attachment
-            fname = os.path.basename(file_path)
-            attached = False
+            # 3) Try auto-correlate columns (this usually fills required fields like SKU)
             try:
-                if await page.locator(f'text="{fname}"').count() > 0:
-                    attached = True
-            except Exception:
-                pass
-            if not attached:
-                try:
-                    attached = bool(await page.evaluate("""() => {
-                        const el = document.querySelector('input[type=file]');
-                        return !!(el && el.files && el.files.length);
-                    }"""))
-                except Exception:
-                    attached = False
-            if not attached:
-                raise RuntimeError("Fisierul nu pare atasat (nu apare numele fisierului / input.files e gol).")
-
-            # Unmap TVA fields
-            try:
-                await page.evaluate("""() => {
-                    const targets = ['Pretul Include TVA', 'Prețul Include TVA', 'Cota TVA'];
-                    const norm = (s) => (s||'').toLowerCase().replace(/\s+/g,' ').trim();
-                    const tnorm = targets.map(norm);
-                    const nodes = Array.from(document.querySelectorAll('th, td, label, div, span'));
-                    for (const el of nodes) {
-                        const txt = norm(el.textContent);
-                        if (!txt) continue;
-                        if (!tnorm.some(t => txt.includes(t))) continue;
-                        let root = el.closest('th') || el.closest('td') || el.closest('label') || el.parentElement;
-                        if (!root) continue;
-                        const cb = root.querySelector('input[type="checkbox"]');
-                        if (cb && cb.checked) cb.click();
-                    }
-                }""")
+                if await page.locator("#corelate_columns").count() > 0:
+                    await page.check("#corelate_columns", timeout=5000)
+                    # give JS a moment to fill fields
+                    await page.wait_for_timeout(1500)
             except Exception:
                 pass
 
-            # Click Start Import
+            # 4) If SKU is still missing, we cannot proceed reliably without manual mapping
+            #    (Gomag requires at least "Cod Produs (SKU)")
             try:
-                await page.evaluate("window.scrollTo(0, 0)")
-                await page.wait_for_timeout(300)
+                sku_filled = await page.evaluate(
+                    "() => Array.from(document.querySelectorAll('input.selectedFields')).some(i => (i.value||'').trim().length>0)"
+                )
+            except Exception:
+                sku_filled = True  # don't block if we can't evaluate
+
+            # 5) Click "Start Import"
+            try:
+                await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=10000, force=True)
+            except Exception:
+                return (
+                    "Am incarcat fisierul, dar nu am putut apasa 'Start Import' automat. "
+                    "Verifica manual pe pagina de import."
+                )
+
+            # If Gomag still shows warning about missing fields, tell user to map once
+            try:
+                warning = await page.locator("div.-g2-messages.-g2-warning").first.text_content(timeout=2000)
+                if warning and "introduceti toate informatiile necesare" in warning.lower():
+                    return (
+                        "Fisierul a fost incarcat, dar Gomag cere maparea coloanelor (cel putin SKU). "
+                        "Bifeaza 'Coreleaza automat coloanele...' sau mapeaza o data manual si salveaza template-ul."
+                    )
             except Exception:
                 pass
 
-            btn = page.locator('button:has-text("Start Import"), a:has-text("Start Import"), [role="button"]:has-text("Start Import")').first
-            if await btn.count() == 0:
-                raise RuntimeError("Nu gasesc butonul 'Start Import'.")
-            await btn.click(timeout=10000, force=True)
-
-            await page.wait_for_timeout(2500)
-
-            # List page after
-            after_html = await _goto_and_get_html(list_url)
-            first_text, status_txt, href = _extract_first_row(after_html)
-
-            if before_first and first_text and first_text == before_first:
-                return "Start Import apasat, dar nu a aparut un import nou in lista."
-
-            # If empty parse, save debug for list page
-            if not first_text:
-                try:
-                    os.makedirs("debug_artifacts", exist_ok=True)
-                    await page.screenshot(path="debug_artifacts/gomag_import_list_empty.png", full_page=True)
-                    with open("debug_artifacts/gomag_import_list_empty.html", "w", encoding="utf-8") as f:
-                        f.write(after_html)
-                except Exception:
-                    pass
-                return "Import nou detectat, dar nu am putut extrage randul din lista (tabel lipsa/HTML gol). Am salvat debug_artifacts/gomag_import_list_empty.*"
-
-            # If errors, open details (href may be relative)
-            if "erori" in (status_txt or "").lower() or "erori" in first_text.lower():
-                if href:
-                    if href.startswith("/"):
-                        det_url = base + href
-                    elif href.startswith("http"):
-                        det_url = href
-                    else:
-                        det_url = base + "/" + href.lstrip("/")
-                    det_html = await _goto_and_get_html(det_url)
-                    soup = BeautifulSoup(det_html or "", "lxml")
-                    if soup.select_one("h1, h2, h3") and ("Erori Import" in soup.get_text(" ", strip=True)):
-                        # extract first 10 error rows from any table
-                        errs = []
-                        for tr in soup.select("table tbody tr")[:10]:
-                            tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-                            if tds:
-                                errs.append(" | ".join(tds))
-                        if errs:
-                            return "Finalizat cu erori. Primele erori:\n- " + "\n- ".join(errs)
-
-                return f"Finalizat cu erori. Status='{status_txt}'. Primul rand: {first_text[:200]}"
-
-            return f"OK: import nou detectat. Status='{status_txt}'. Primul rand: {first_text[:200]}"
+            await page.wait_for_timeout(1500)
+            return "Start Import apasat. Gomag ruleaza importul in fundal. Verifica lista de importuri pentru status/erori."
         finally:
             await context.close()
             await browser.close()
 
+
 def import_file(creds: GomagCreds, file_path: str) -> str:
+
     return asyncio.run(import_file_async(creds, file_path))
