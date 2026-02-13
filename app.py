@@ -20,7 +20,7 @@ import pandas as pd
 import tempfile
 from src.utils import detect_url_column
 from src.pipeline import scrape_products
-from src.export_gomag import to_gomag_dataframe, save_xlsx
+from src.export_gomag import to_gomag_dataframe, save_tsv
 from src.gomag_ui import GomagCreds, fetch_categories, import_file
 
 st.set_page_config(page_title="Gomag Importer", layout="wide")
@@ -126,21 +126,21 @@ if st.session_state["drafts"]:
     st.subheader("4) Genereaza fisier import Gomag")
     col1, col2, col3 = st.columns([1,1,1])
     with col1:
-        if st.button("Genereaza XLSX"):
+        if st.button("Genereaza TSV"):
             # push category back into drafts via map
             category_map = {row["source_url"]: row.get("category","") for _, row in edited.iterrows()}
             df_gomag = to_gomag_dataframe(drafts, category_map=category_map)
 
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
             tmp.close()
-            save_xlsx(df_gomag, tmp.name)
+            save_tsv(df_gomag, tmp.name)
 
             with open(tmp.name, "rb") as f:
                 st.download_button(
-                    "Descarca import_gomag.xlsx",
+                    "Descarca import_gomag.tsv",
                     data=f,
-                    file_name="import_gomag.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    file_name="import_gomag.tsv",
+                    mime="text/tab-separated-values",
                     type="primary"
                 )
             st.dataframe(df_gomag.head(50), use_container_width=True)
