@@ -122,45 +122,30 @@ def _parse_categories_from_html(html: str) -> List[str]:
 
     cats: List[str] = []
 
-    # 1) tabel - prima coloana (doar randuri reale)
+    # 1) tabel - prima coloana
     rows = soup.select("table tbody tr")
     for tr in rows:
         tds = tr.find_all("td")
         if not tds:
             continue
-
         name = tds[0].get_text(" ", strip=True).replace("\u00a0", " ").strip()
         name = name.split("ID:")[0].strip()
-
-        if not name:
-            continue
-        low = name.lower()
-
-        # filtre UI / zgomot
-        if low in {"categorie", "categorii", "actiuni", "acțiuni", "nume", "name"}:
-            continue
-        if len(name) < 2 or len(name) > 80:
-            continue
-
-        cats.append(name)
+        if name:
+            cats.append(name)
 
     cats = _dedupe_keep_order(cats)
     if cats:
         return cats
 
-    # 2) fallback: link-uri care par a fi categorii (daca nu exista tabel)
+    # 2) fallback: link-uri care par a fi categorii
     for a in soup.select('a[href*="/gomag/product/category"]'):
         txt = a.get_text(" ", strip=True)
-        if not txt:
-            continue
-        low = txt.lower()
-        if low in {"categorie", "categorii", "actiuni", "acțiuni", "nume", "name"}:
-            continue
-        if len(txt) < 2 or len(txt) > 80:
-            continue
-        cats.append(txt)
+        if txt and len(txt) < 80:
+            cats.append(txt)
 
     return _dedupe_keep_order(cats)
+
+
 # ============================================================
 # Gomag UI API (folosit de app.py)
 # ============================================================
@@ -261,6 +246,72 @@ def fetch_categories(creds: GomagCreds) -> List[str]:
     return asyncio.run(fetch_categories_async(creds))
 
 
+async def _set_input_files_anywhere(page, file_path: str, timeout_ms: int = 60000) -> str:
+    """Cauta un input[type=file] pe pagina sau in iframe-uri si face upload.
+    Returneaza un mesaj scurt cu unde a reusit.
+    """
+    candidates = [
+        'input[type="file"]',
+        'input[type="file"][name]',
+        'input[type="file"][accept]',
+        'input[accept*="csv" i]',
+        'input[accept*="xls" i]',
+        'input[accept*="xlsx" i]',
+    ]
+
+    # Main page
+    for sel in candidates:
+        try:
+            loc = page.locator(sel).first
+            await loc.wait_for(state="attached", timeout=timeout_ms // 3)
+            # unhide just in case
+            try:
+                await page.evaluate(
+                    """(sel) => {
+                        const el = document.querySelector(sel);
+                        if (!el) return;
+                        el.style.display = 'block';
+                        el.style.visibility = 'visible';
+                        el.style.opacity = 1;
+                        el.removeAttribute('hidden');
+                    }""", sel
+                )
+            except Exception:
+                pass
+            await loc.set_input_files(file_path, timeout=timeout_ms // 3)
+            return f"main:{sel}"
+        except Exception:
+            continue
+
+    # Iframes
+    for fr in page.frames:
+        if fr == page.main_frame:
+            continue
+        for sel in candidates:
+            try:
+                loc = fr.locator(sel).first
+                await loc.wait_for(state="attached", timeout=timeout_ms // 3)
+                try:
+                    await fr.evaluate(
+                        """(sel) => {
+                            const el = document.querySelector(sel);
+                            if (!el) return;
+                            el.style.display = 'block';
+                            el.style.visibility = 'visible';
+                            el.style.opacity = 1;
+                            el.removeAttribute('hidden');
+                        }""", sel
+                    )
+                except Exception:
+                    pass
+                await loc.set_input_files(file_path, timeout=timeout_ms // 3)
+                return f"frame:{sel}"
+            except Exception:
+                continue
+
+    raise RuntimeError("Nu am gasit niciun <input type=file> pe pagina (nici in iframe-uri).")
+
+
 async def import_file_async(creds: GomagCreds, file_path: str) -> str:
     cfg = _load_cfg()
     _ensure_playwright_chromium_installed()
@@ -273,26 +324,61 @@ async def import_file_async(creds: GomagCreds, file_path: str) -> str:
             await _login(page, creds, cfg)
 
             await _goto_with_fallback(page, url)
-            await _wait_render(page, 1000)
+            await _wait_render(page, 1400)
 
-            # upload
-            await page.set_input_files(cfg["gomag"]["import"]["file_input_selector"], file_path)
+            # Uneori input-ul apare doar dupa click pe un buton (Upload/Import).
+            open_btn_selectors = []
+            if cfg.get("gomag", {}).get("import", {}).get("open_import_selector"):
+                open_btn_selectors.append(cfg["gomag"]["import"]["open_import_selector"])
 
-            # attempt start
+            open_btn_selectors += [
+                'button:has-text("Import")',
+                'a:has-text("Import")',
+                'button:has-text("Upload")',
+                'a:has-text("Upload")',
+                'button:has-text("Alege")',
+                'button:has-text("Selecteaza")',
+                'button:has-text("Încarcă")',
+                'button:has-text("Incarca")',
+            ]
+
+            for sel in open_btn_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0:
+                        await btn.click(timeout=1500)
+                        await page.wait_for_timeout(400)
+                        break
+                except Exception:
+                    continue
+
+            # Upload (config selector first, then fallback anywhere)
+            note = ""
+            file_sel = cfg.get("gomag", {}).get("import", {}).get("file_input_selector")
+            if file_sel:
+                try:
+                    loc = page.locator(file_sel).first
+                    await loc.wait_for(state="attached", timeout=15000)
+                    await loc.set_input_files(file_path, timeout=30000)
+                    note = f"cfg:{file_sel}"
+                except Exception:
+                    note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)
+            else:
+                note = await _set_input_files_anywhere(page, file_path, timeout_ms=60000)
+
+            # Start import (daca exista)
             try:
                 await page.click(cfg["gomag"]["import"]["start_import_selector"], timeout=5000)
+                await page.wait_for_timeout(1500)
+                return f"Fisier incarcat ({note}). Import pornit (daca Gomag nu a cerut pasi suplimentari)."
             except Exception:
                 return (
-                    "Am incarcat fisierul, dar nu am putut porni importul automat "
-                    "(probabil e nevoie de mapare coloane manual la prima rulare)."
+                    f"Fisier incarcat ({note}). Nu am putut porni importul automat "
+                    "(probabil e nevoie de mapare coloane/manual la prima rulare)."
                 )
-
-            await page.wait_for_timeout(2000)
-            return "Import pornit (daca Gomag nu a cerut pasi suplimentari)."
         finally:
             await context.close()
             await browser.close()
-
 
 def import_file(creds: GomagCreds, file_path: str) -> str:
     return asyncio.run(import_file_async(creds, file_path))
